@@ -107,7 +107,7 @@ impl<'a> Parser<'a> {
         self.pos
     }
 
-    pub fn parse_command(&mut self) -> Result<Option<Vec<String>>, &'static str> {
+    pub fn parse_command(&mut self) -> Result<Option<Vec<&'a [u8]>>, &'static str> {
         if self.pos >= self.buf.len() {
             return Ok(None);
         }
@@ -117,7 +117,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_inline(&mut self) -> Result<Option<Vec<String>>, &'static str> {
+    fn parse_inline(&mut self) -> Result<Option<Vec<&'a [u8]>>, &'static str> {
         let start = self.pos;
         while self.pos < self.buf.len() {
             if self.buf[self.pos] == b'\n' {
@@ -128,10 +128,9 @@ impl<'a> Parser<'a> {
                 };
                 self.pos += 1;
                 let line = &self.buf[start..end];
-                let parts: Vec<String> = line
+                let parts: Vec<&'a [u8]> = line
                     .split(|&b| b == b' ')
                     .filter(|s| !s.is_empty())
-                    .map(|s| String::from_utf8_lossy(s).into_owned())
                     .collect();
                 if parts.is_empty() {
                     return Ok(None);
@@ -144,7 +143,7 @@ impl<'a> Parser<'a> {
         Ok(None)
     }
 
-    fn parse_multibulk(&mut self) -> Result<Option<Vec<String>>, &'static str> {
+    fn parse_multibulk(&mut self) -> Result<Option<Vec<&'a [u8]>>, &'static str> {
         let saved = self.pos;
         self.pos += 1;
         let count = match self.read_line_int() {
@@ -170,20 +169,20 @@ impl<'a> Parser<'a> {
         Ok(Some(args))
     }
 
-    fn parse_bulk_string(&mut self) -> Option<String> {
+    fn parse_bulk_string(&mut self) -> Option<&'a [u8]> {
         if self.pos >= self.buf.len() || self.buf[self.pos] != b'$' {
             return None;
         }
         self.pos += 1;
         let len = self.read_line_int()?;
         if len < 0 {
-            return Some(String::new());
+            return Some(b"");
         }
         let len = len as usize;
         if self.pos + len + 2 > self.buf.len() {
             return None;
         }
-        let data = String::from_utf8_lossy(&self.buf[self.pos..self.pos + len]).into_owned();
+        let data = &self.buf[self.pos..self.pos + len];
         self.pos += len + 2;
         Some(data)
     }

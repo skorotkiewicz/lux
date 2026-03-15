@@ -3,14 +3,26 @@ use std::fs;
 use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const SNAPSHOT_PATH: &str = "lux.dat";
-const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
+fn snapshot_path() -> String {
+    let dir = std::env::var("LUX_DATA_DIR").unwrap_or_else(|_| ".".to_string());
+    format!("{}/lux.dat", dir.trim_end_matches('/'))
+}
+
+fn snapshot_interval() -> Duration {
+    let secs: u64 = std::env::var("LUX_SAVE_INTERVAL")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    Duration::from_secs(secs)
+}
 
 pub fn save(store: &Store) -> io::Result<usize> {
-    let entries = store.dump_all();
-    let tmp = format!("{SNAPSHOT_PATH}.tmp");
+    let path = snapshot_path();
+    let now = Instant::now();
+    let entries = store.dump_all(now);
+    let tmp = format!("{path}.tmp");
     let mut file = fs::File::create(&tmp)?;
     for entry in &entries {
         let type_char = match &entry.value {
@@ -32,12 +44,13 @@ pub fn save(store: &Store) -> io::Result<usize> {
         writeln!(file, "{}\t{}\t{}\t{}", type_char, entry.key, encoded_value, entry.ttl_ms)?;
     }
     file.sync_all()?;
-    fs::rename(&tmp, SNAPSHOT_PATH)?;
+    fs::rename(&tmp, &path)?;
     Ok(entries.len())
 }
 
 pub fn load(store: &Store) -> io::Result<usize> {
-    let path = Path::new(SNAPSHOT_PATH);
+    let path_str = snapshot_path();
+    let path = Path::new(&path_str);
     if !path.exists() {
         return Ok(0);
     }
@@ -129,8 +142,9 @@ pub fn load(store: &Store) -> io::Result<usize> {
 }
 
 pub async fn background_save_loop(store: Arc<Store>) {
+    let interval = snapshot_interval();
     loop {
-        tokio::time::sleep(SNAPSHOT_INTERVAL).await;
+        tokio::time::sleep(interval).await;
         match save(&store) {
             Ok(n) => println!("snapshot: saved {n} keys"),
             Err(e) => eprintln!("snapshot error: {e}"),
