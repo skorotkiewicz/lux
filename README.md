@@ -5,8 +5,14 @@
 <h1 align="center">Lux</h1>
 
 <p align="center">
-  <strong>A drop-in Redis replacement. 3-5x faster.</strong><br/>
+  <strong>A Redis-compatible key-value store. 3-5x faster.</strong><br/>
   Multi-threaded. Written in Rust. MIT licensed forever.
+</p>
+
+<p align="center">
+  <a href="https://github.com/lux-db/lux/actions/workflows/test.yml"><img src="https://github.com/lux-db/lux/actions/workflows/test.yml/badge.svg" alt="Tests" /></a>
+  <a href="https://github.com/lux-db/lux/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License" /></a>
+  <a href="https://crates.io/crates/lux"><img src="https://img.shields.io/crates/v/lux.svg" alt="crates.io" /></a>
 </p>
 
 <p align="center">
@@ -19,7 +25,7 @@
 
 ## Why Lux?
 
-Redis is single-threaded by design. Every command runs on one core. Lux takes the opposite approach: a **sharded concurrent architecture** built in Rust that safely uses all your cores. Change your connection string. Everything else stays the same.
+Redis is single-threaded by design. Every command runs on one core. Lux takes the opposite approach: a **sharded concurrent architecture** built in Rust that safely uses all your cores. Point your existing Redis client at Lux. Most workloads just work.
 
 **Works with every Redis client** -- ioredis, redis-py, go-redis, Jedis, redis-rb. Zero code changes.
 
@@ -48,11 +54,11 @@ Don't want to manage infrastructure? **[Lux Cloud](https://luxdb.dev)** is manag
 
 ## Features
 
-- **80+ Redis commands** -- strings, lists, hashes, sets, pub/sub
-- **RESP protocol** -- drop-in compatible with every Redis client
+- **100+ Redis commands** -- strings, lists, hashes, sets, sorted sets, pub/sub
+- **RESP2 protocol** -- compatible with every Redis client
 - **Multi-threaded** -- auto-tuned shards, parking_lot RwLocks, tokio async runtime
 - **Zero-copy parser** -- RESP arguments are byte slices into the read buffer
-- **Pipeline batching** -- commands grouped by shard, one lock acquisition per batch
+- **Pipeline batching** -- consecutive same-shard commands batched, preserving per-client ordering
 - **Persistence** -- automatic snapshots, configurable interval
 - **Auth** -- password authentication via `LUX_PASSWORD`
 - **Pub/Sub** -- SUBSCRIBE, UNSUBSCRIBE, PUBLISH
@@ -131,30 +137,58 @@ rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 rdb.Set(ctx, "hello", "world", 0)
 ```
 
-## Development
+## Testing
 
-Before submitting changes, run `cargo fmt` to auto-format your code and `cargo clippy` to catch common issues:
+Lux has 113 tests covering the RESP parser, store operations, command dispatch, pub/sub, snapshot persistence, and pipeline ordering.
 
 ```bash
-cargo fmt
-cargo clippy --all-targets --all-features -- -D warnings
+cargo test
 ```
+
+Run the benchmark against Redis:
+
+```bash
+./bench.sh
+```
+
+### CI
+
+Every push and pull request runs:
+
+- `cargo fmt -- --check`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test --all-targets`
+- Integration tests against the Valkey test harness
 
 ## Supported Commands
 
-**Strings:** `SET` `GET` `SETNX` `SETEX` `PSETEX` `GETSET` `MGET` `MSET` `STRLEN` `APPEND` `INCR` `DECR` `INCRBY` `DECRBY`
+**Strings:** `SET` `GET` `SETNX` `SETEX` `PSETEX` `GETSET` `GETDEL` `GETEX` `GETRANGE` `SETRANGE` `MGET` `MSET` `MSETNX` `STRLEN` `APPEND` `INCR` `DECR` `INCRBY` `DECRBY` `INCRBYFLOAT`
 
-**Keys:** `DEL` `EXISTS` `KEYS` `SCAN` `TYPE` `RENAME` `TTL` `PTTL` `EXPIRE` `PEXPIRE` `PERSIST` `DBSIZE` `FLUSHDB` `FLUSHALL`
+**Keys:** `DEL` `UNLINK` `EXISTS` `KEYS` `SCAN` `TYPE` `RENAME` `RENAMENX` `RANDOMKEY` `COPY` `TTL` `PTTL` `EXPIRE` `PEXPIRE` `EXPIREAT` `PEXPIREAT` `EXPIRETIME` `PEXPIRETIME` `PERSIST` `DBSIZE` `FLUSHDB` `FLUSHALL`
 
-**Lists:** `LPUSH` `RPUSH` `LPOP` `RPOP` `LLEN` `LRANGE` `LINDEX`
+**Lists:** `LPUSH` `RPUSH` `LPUSHX` `RPUSHX` `LPOP` `RPOP` `LLEN` `LRANGE` `LINDEX` `LSET` `LINSERT` `LREM` `LTRIM` `LPOS` `LMOVE` `RPOPLPUSH`
 
-**Hashes:** `HSET` `HMSET` `HGET` `HMGET` `HDEL` `HGETALL` `HKEYS` `HVALS` `HLEN` `HEXISTS` `HINCRBY`
+**Hashes:** `HSET` `HSETNX` `HMSET` `HGET` `HMGET` `HDEL` `HGETALL` `HKEYS` `HVALS` `HLEN` `HEXISTS` `HINCRBY` `HINCRBYFLOAT` `HSTRLEN` `HRANDFIELD` `HSCAN`
 
-**Sets:** `SADD` `SREM` `SMEMBERS` `SISMEMBER` `SCARD` `SUNION` `SINTER` `SDIFF`
+**Sets:** `SADD` `SREM` `SMEMBERS` `SISMEMBER` `SMISMEMBER` `SCARD` `SPOP` `SRANDMEMBER` `SMOVE` `SUNION` `SINTER` `SDIFF` `SUNIONSTORE` `SINTERSTORE` `SDIFFSTORE` `SINTERCARD` `SSCAN`
+
+**Sorted Sets:** `ZADD` `ZSCORE` `ZMSCORE` `ZRANK` `ZREVRANK` `ZREM` `ZCARD` `ZCOUNT` `ZLEXCOUNT` `ZINCRBY` `ZRANGE` `ZREVRANGE` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZRANGEBYLEX` `ZREVRANGEBYLEX` `ZPOPMIN` `ZPOPMAX` `ZUNIONSTORE` `ZINTERSTORE` `ZDIFFSTORE` `ZREMRANGEBYRANK` `ZREMRANGEBYSCORE` `ZREMRANGEBYLEX` `ZSCAN`
 
 **Pub/Sub:** `PUBLISH` `SUBSCRIBE` `UNSUBSCRIBE`
 
-**Server:** `PING` `ECHO` `INFO` `SAVE` `BGSAVE` `LASTSAVE` `AUTH` `CONFIG` `CLIENT` `SELECT` `COMMAND` `DUMP` `RESTORE`
+**Server:** `PING` `ECHO` `HELLO` `INFO` `TIME` `SAVE` `BGSAVE` `LASTSAVE` `AUTH` `CONFIG` `CLIENT` `SELECT` `COMMAND` `OBJECT` `MEMORY`
+
+## Known Differences from Redis
+
+Lux is Redis-compatible but not identical. Key differences:
+
+- **No Lua scripting** -- `EVAL`, `EVALSHA`, and `SCRIPT` are not supported
+- **No MULTI/EXEC transactions** -- commands are acknowledged but not transactional
+- **No blocking commands** -- `BLPOP`, `BRPOP`, `BLMOVE` etc. are not supported
+- **No AOF persistence** -- snapshots only (configurable interval)
+- **No RESP3 protocol** -- RESP2 only
+- **No cluster mode** -- single-node only (use Lux Cloud for managed hosting)
+- **Pipeline ordering** -- per-client command order is preserved. Consecutive same-shard commands are batched for performance
 
 ## Architecture
 
@@ -163,7 +197,7 @@ Client connections (tokio tasks)
         |
    Zero-Copy RESP Parser (byte slices, no allocations)
         |
-   Pipeline Batching (group by shard, sort, batch execute)
+   Pipeline Batching (consecutive same-shard commands batched)
         |
    Command Dispatch (byte-level matching, no string conversion)
         |

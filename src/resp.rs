@@ -257,3 +257,170 @@ pub mod itoa {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_set_command() {
+        let input = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+        let mut parser = Parser::new(input);
+        let args = parser.parse_command().unwrap().unwrap();
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], b"SET");
+        assert_eq!(args[1], b"foo");
+        assert_eq!(args[2], b"bar");
+        assert_eq!(parser.pos(), input.len());
+    }
+
+    #[test]
+    fn parse_get_command() {
+        let input = b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n";
+        let mut parser = Parser::new(input);
+        let args = parser.parse_command().unwrap().unwrap();
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], b"GET");
+        assert_eq!(args[1], b"foo");
+    }
+
+    #[test]
+    fn parse_multi_bulk_array() {
+        let input = b"*5\r\n$4\r\nMSET\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n";
+        let mut parser = Parser::new(input);
+        let args = parser.parse_command().unwrap().unwrap();
+        assert_eq!(args.len(), 5);
+        assert_eq!(args[0], b"MSET");
+    }
+
+    #[test]
+    fn parse_null_bulk_string() {
+        let input = b"*2\r\n$3\r\nGET\r\n$-1\r\n";
+        let mut parser = Parser::new(input);
+        let args = parser.parse_command().unwrap().unwrap();
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[1], b"");
+    }
+
+    #[test]
+    fn parse_integer_response() {
+        let mut buf = BytesMut::new();
+        write_integer(&mut buf, 42);
+        assert_eq!(&buf[..], b":42\r\n");
+    }
+
+    #[test]
+    fn parse_negative_integer() {
+        let mut buf = BytesMut::new();
+        write_integer(&mut buf, -100);
+        assert_eq!(&buf[..], b":-100\r\n");
+    }
+
+    #[test]
+    fn parse_special_integers() {
+        let mut buf = BytesMut::new();
+        write_integer(&mut buf, 0);
+        assert_eq!(&buf[..], ZERO);
+        buf.clear();
+        write_integer(&mut buf, 1);
+        assert_eq!(&buf[..], ONE);
+        buf.clear();
+        write_integer(&mut buf, -1);
+        assert_eq!(&buf[..], NEG_ONE);
+        buf.clear();
+        write_integer(&mut buf, -2);
+        assert_eq!(&buf[..], NEG_TWO);
+    }
+
+    #[test]
+    fn incomplete_buffer_returns_none() {
+        let input = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n";
+        let mut parser = Parser::new(input);
+        let result = parser.parse_command().unwrap();
+        assert!(result.is_none());
+        assert_eq!(parser.pos(), 0);
+    }
+
+    #[test]
+    fn parse_inline_command() {
+        let input = b"PING\r\n";
+        let mut parser = Parser::new(input);
+        let args = parser.parse_command().unwrap().unwrap();
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0], b"PING");
+    }
+
+    #[test]
+    fn parse_inline_with_args() {
+        let input = b"SET foo bar\r\n";
+        let mut parser = Parser::new(input);
+        let args = parser.parse_command().unwrap().unwrap();
+        assert_eq!(args.len(), 3);
+        assert_eq!(args[0], b"SET");
+        assert_eq!(args[1], b"foo");
+        assert_eq!(args[2], b"bar");
+    }
+
+    #[test]
+    fn write_bulk_string() {
+        let mut buf = BytesMut::new();
+        write_bulk(&mut buf, "hello");
+        assert_eq!(&buf[..], b"$5\r\nhello\r\n");
+    }
+
+    #[test]
+    fn write_array() {
+        let mut buf = BytesMut::new();
+        write_array_header(&mut buf, 3);
+        assert_eq!(&buf[..], b"*3\r\n");
+    }
+
+    #[test]
+    fn write_empty_array() {
+        let mut buf = BytesMut::new();
+        write_array_header(&mut buf, 0);
+        assert_eq!(&buf[..], EMPTY_ARRAY);
+    }
+
+    #[test]
+    fn write_error_response() {
+        let mut buf = BytesMut::new();
+        write_error(&mut buf, "ERR test error");
+        assert_eq!(&buf[..], b"-ERR test error\r\n");
+    }
+
+    #[test]
+    fn write_simple_string() {
+        let mut buf = BytesMut::new();
+        write_simple(&mut buf, "OK");
+        assert_eq!(&buf[..], b"+OK\r\n");
+    }
+
+    #[test]
+    fn parse_two_commands_in_sequence() {
+        let input = b"*2\r\n$3\r\nGET\r\n$1\r\na\r\n*2\r\n$3\r\nGET\r\n$1\r\nb\r\n";
+        let mut parser = Parser::new(input);
+        let args1 = parser.parse_command().unwrap().unwrap();
+        assert_eq!(args1[1], b"a");
+        let args2 = parser.parse_command().unwrap().unwrap();
+        assert_eq!(args2[1], b"b");
+        assert!(parser.parse_command().unwrap().is_none());
+    }
+
+    #[test]
+    fn itoa_format_i64() {
+        let mut buf = itoa::Buffer::new();
+        assert_eq!(buf.format_i64(0), "0");
+        assert_eq!(buf.format_i64(42), "42");
+        assert_eq!(buf.format_i64(-42), "-42");
+        assert_eq!(buf.format_i64(i64::MAX), "9223372036854775807");
+        assert_eq!(buf.format_i64(i64::MIN), "-9223372036854775808");
+    }
+
+    #[test]
+    fn itoa_format_usize() {
+        let mut buf = itoa::Buffer::new();
+        assert_eq!(buf.format_usize(0), "0");
+        assert_eq!(buf.format_usize(12345), "12345");
+    }
+}

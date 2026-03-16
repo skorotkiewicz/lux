@@ -15,7 +15,7 @@ pub enum CmdResult {
 }
 
 fn is_restricted() -> bool {
-    std::env::var("LUX_RESTRICTED").map_or(false, |v| v == "1" || v == "true")
+    std::env::var("LUX_RESTRICTED").is_ok_and(|v| v == "1" || v == "true")
 }
 
 #[inline(always)]
@@ -224,7 +224,7 @@ pub fn execute(
             resp::write_optional_bulk_raw(out, &store.get(key, now));
         }
     } else if cmd_eq(cmd, b"MSET") {
-        if args.len() < 3 || (args.len() - 1) % 2 != 0 {
+        if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
             resp::write_error(out, "ERR wrong number of arguments for 'mset' command");
             return CmdResult::Written;
         }
@@ -337,11 +337,7 @@ pub fn execute(
         let keys: Vec<String> = if let Some(tf) = type_filter {
             all_keys
                 .into_iter()
-                .filter(|k| {
-                    store
-                        .get_entry_type(k.as_bytes(), now)
-                        .map_or(false, |t| t == tf)
-                })
+                .filter(|k| store.get_entry_type(k.as_bytes(), now) == Some(tf))
                 .collect()
         } else {
             all_keys
@@ -536,7 +532,7 @@ pub fn execute(
         let index = parse_i64(args[2]).unwrap_or(0);
         resp::write_optional_bulk_raw(out, &store.lindex(args[1], index, now));
     } else if cmd_eq(cmd, b"HSET") || cmd_eq(cmd, b"HMSET") {
-        if args.len() < 4 || (args.len() - 2) % 2 != 0 {
+        if args.len() < 4 || !(args.len() - 2).is_multiple_of(2) {
             let cmd_name = if cmd_eq(cmd, b"HMSET") {
                 "hmset"
             } else {
@@ -745,9 +741,7 @@ pub fn execute(
         } else {
             resp::write_ok(out);
         }
-    } else if cmd_eq(cmd, b"CLIENT") {
-        resp::write_ok(out);
-    } else if cmd_eq(cmd, b"SELECT") {
+    } else if cmd_eq(cmd, b"CLIENT") || cmd_eq(cmd, b"SELECT") {
         resp::write_ok(out);
     } else if cmd_eq(cmd, b"COMMAND") {
         if args.len() > 1 && cmd_eq(args[1], b"DOCS") {
@@ -832,7 +826,7 @@ pub fn execute(
             ),
         );
     } else if cmd_eq(cmd, b"MSETNX") {
-        if args.len() < 3 || (args.len() - 1) % 2 != 0 {
+        if args.len() < 3 || !(args.len() - 1).is_multiple_of(2) {
             resp::write_error(out, "ERR wrong number of arguments for 'msetnx' command");
             return CmdResult::Written;
         }
@@ -843,7 +837,7 @@ pub fn execute(
             resp::write_error(out, "ERR wrong number of arguments for 'unlink' command");
             return CmdResult::Written;
         }
-        resp::write_integer(out, store.unlink(&args[1..].to_vec()));
+        resp::write_integer(out, store.unlink(&args[1..]));
     } else if cmd_eq(cmd, b"EXPIREAT") {
         if args.len() < 3 {
             resp::write_error(out, "ERR wrong number of arguments for 'expireat' command");
@@ -934,13 +928,13 @@ pub fn execute(
             resp::write_error(out, "ERR wrong number of arguments for 'lpushx' command");
             return CmdResult::Written;
         }
-        resp::write_integer(out, store.lpushx(args[1], &args[2..].to_vec(), now));
+        resp::write_integer(out, store.lpushx(args[1], &args[2..], now));
     } else if cmd_eq(cmd, b"RPUSHX") {
         if args.len() < 3 {
             resp::write_error(out, "ERR wrong number of arguments for 'rpushx' command");
             return CmdResult::Written;
         }
-        resp::write_integer(out, store.rpushx(args[1], &args[2..].to_vec(), now));
+        resp::write_integer(out, store.rpushx(args[1], &args[2..], now));
     } else if cmd_eq(cmd, b"LPOS") {
         if args.len() < 3 {
             resp::write_error(out, "ERR wrong number of arguments for 'lpos' command");
@@ -1169,7 +1163,7 @@ pub fn execute(
             );
             return CmdResult::Written;
         }
-        let results = store.smismember(args[1], &args[2..].to_vec(), now);
+        let results = store.smismember(args[1], &args[2..], now);
         resp::write_array_header(out, results.len());
         for r in results {
             resp::write_integer(out, if r { 1 } else { 0 });
@@ -1182,7 +1176,7 @@ pub fn execute(
             );
             return CmdResult::Written;
         }
-        match store.sdiffstore(args[1], &args[2..].to_vec(), now) {
+        match store.sdiffstore(args[1], &args[2..], now) {
             Ok(n) => resp::write_integer(out, n),
             Err(e) => resp::write_error(out, &e),
         }
@@ -1194,7 +1188,7 @@ pub fn execute(
             );
             return CmdResult::Written;
         }
-        match store.sinterstore(args[1], &args[2..].to_vec(), now) {
+        match store.sinterstore(args[1], &args[2..], now) {
             Ok(n) => resp::write_integer(out, n),
             Err(e) => resp::write_error(out, &e),
         }
@@ -1206,7 +1200,7 @@ pub fn execute(
             );
             return CmdResult::Written;
         }
-        match store.sunionstore(args[1], &args[2..].to_vec(), now) {
+        match store.sunionstore(args[1], &args[2..], now) {
             Ok(n) => resp::write_integer(out, n),
             Err(e) => resp::write_error(out, &e),
         }
@@ -1223,7 +1217,7 @@ pub fn execute(
             resp::write_error(out, "ERR syntax error");
             return CmdResult::Written;
         }
-        match store.sinter(&args[2..2 + numkeys].to_vec(), now) {
+        match store.sinter(&args[2..2 + numkeys], now) {
             Ok(r) => resp::write_integer(out, r.len() as i64),
             Err(e) => resp::write_error(out, &e),
         }
@@ -1328,21 +1322,19 @@ pub fn execute(
                     } else {
                         resp::write_error(out, "WRONGTYPE");
                     }
-                } else {
-                    if let StoreValue::Set(set) = &entry.value {
-                        let all: Vec<_> = set.iter().collect();
-                        let s = cursor.min(all.len());
-                        let e = (s + count).min(all.len());
-                        let next = if e >= all.len() { 0 } else { e };
-                        resp::write_array_header(out, 2);
-                        resp::write_bulk(out, &next.to_string());
-                        resp::write_array_header(out, e - s);
-                        for m in &all[s..e] {
-                            resp::write_bulk(out, m);
-                        }
-                    } else {
-                        resp::write_error(out, "WRONGTYPE");
+                } else if let StoreValue::Set(set) = &entry.value {
+                    let all: Vec<_> = set.iter().collect();
+                    let s = cursor.min(all.len());
+                    let e = (s + count).min(all.len());
+                    let next = if e >= all.len() { 0 } else { e };
+                    resp::write_array_header(out, 2);
+                    resp::write_bulk(out, &next.to_string());
+                    resp::write_array_header(out, e - s);
+                    for m in &all[s..e] {
+                        resp::write_bulk(out, m);
                     }
+                } else {
+                    resp::write_error(out, "WRONGTYPE");
                 }
             }
             _ => {
@@ -1559,6 +1551,13 @@ pub fn execute(
                                 "hashtable"
                             }
                         }
+                        StoreValue::SortedSet(_, scores) => {
+                            if scores.len() < 128 {
+                                "listpack"
+                            } else {
+                                "skiplist"
+                            }
+                        }
                     };
                     resp::write_bulk(out, enc);
                 }
@@ -1586,6 +1585,9 @@ pub fn execute(
                                 h.iter().map(|(k, v)| k.len() + v.len() + 32).sum::<usize>()
                             }
                             StoreValue::Set(s) => s.iter().map(|m| m.len() + 16).sum::<usize>(),
+                            StoreValue::SortedSet(_, scores) => {
+                                scores.iter().map(|(m, _)| m.len() + 48).sum::<usize>()
+                            }
                         };
                     resp::write_integer(out, size as i64);
                 }
@@ -1626,10 +1628,723 @@ pub fn execute(
         return CmdResult::Subscribe {
             channels: args[1..].iter().map(|a| arg_str(a).to_string()).collect(),
         };
+    } else if cmd_eq(cmd, b"ZADD") {
+        if args.len() < 4 {
+            resp::write_error(out, "ERR wrong number of arguments for 'zadd' command");
+            return CmdResult::Written;
+        }
+        let mut nx = false;
+        let mut xx = false;
+        let mut gt = false;
+        let mut lt = false;
+        let mut ch = false;
+        let mut i = 2;
+        while i < args.len() {
+            if cmd_eq(args[i], b"NX") {
+                nx = true;
+                i += 1;
+            } else if cmd_eq(args[i], b"XX") {
+                xx = true;
+                i += 1;
+            } else if cmd_eq(args[i], b"GT") {
+                gt = true;
+                i += 1;
+            } else if cmd_eq(args[i], b"LT") {
+                lt = true;
+                i += 1;
+            } else if cmd_eq(args[i], b"CH") {
+                ch = true;
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if !(args.len() - i).is_multiple_of(2) || i >= args.len() {
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
+        }
+        let mut members = Vec::new();
+        while i + 1 < args.len() {
+            let score: f64 = match arg_str(args[i]).parse() {
+                Ok(s) => s,
+                Err(_) => {
+                    resp::write_error(out, "ERR value is not a valid float");
+                    return CmdResult::Written;
+                }
+            };
+            members.push((args[i + 1], score));
+            i += 2;
+        }
+        match store.zadd(args[1], &members, nx, xx, gt, lt, ch, now) {
+            Ok(n) => resp::write_integer(out, n),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZSCORE") {
+        if args.len() != 3 {
+            resp::write_error(out, "ERR wrong number of arguments for 'zscore' command");
+            return CmdResult::Written;
+        }
+        match store.zscore(args[1], args[2], now) {
+            Ok(Some(s)) => {
+                let ss = format_float(s);
+                resp::write_bulk(out, &ss);
+            }
+            Ok(None) => resp::write_null(out),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZRANK") {
+        if args.len() != 3 {
+            resp::write_error(out, "ERR wrong number of arguments for 'zrank' command");
+            return CmdResult::Written;
+        }
+        match store.zrank(args[1], args[2], false, now) {
+            Ok(Some(r)) => resp::write_integer(out, r),
+            Ok(None) => resp::write_null(out),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZREVRANK") {
+        if args.len() != 3 {
+            resp::write_error(out, "ERR wrong number of arguments for 'zrevrank' command");
+            return CmdResult::Written;
+        }
+        match store.zrank(args[1], args[2], true, now) {
+            Ok(Some(r)) => resp::write_integer(out, r),
+            Ok(None) => resp::write_null(out),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZREM") {
+        if args.len() < 3 {
+            resp::write_error(out, "ERR wrong number of arguments for 'zrem' command");
+            return CmdResult::Written;
+        }
+        let members: Vec<&[u8]> = args[2..].to_vec();
+        match store.zrem(args[1], &members, now) {
+            Ok(n) => resp::write_integer(out, n),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZCARD") {
+        if args.len() != 2 {
+            resp::write_error(out, "ERR wrong number of arguments for 'zcard' command");
+            return CmdResult::Written;
+        }
+        match store.zcard(args[1], now) {
+            Ok(n) => resp::write_integer(out, n),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZRANGE") {
+        if args.len() < 4 {
+            resp::write_error(out, "ERR wrong number of arguments for 'zrange' command");
+            return CmdResult::Written;
+        }
+        let mut reverse = false;
+        let mut with_scores = false;
+        let mut byscore = false;
+        let mut bylex = false;
+        let mut offset: Option<usize> = None;
+        let mut count: Option<usize> = None;
+        let mut i = 4;
+        while i < args.len() {
+            if cmd_eq(args[i], b"REV") {
+                reverse = true;
+                i += 1;
+            } else if cmd_eq(args[i], b"WITHSCORES") {
+                with_scores = true;
+                i += 1;
+            } else if cmd_eq(args[i], b"BYSCORE") {
+                byscore = true;
+                i += 1;
+            } else if cmd_eq(args[i], b"BYLEX") {
+                bylex = true;
+                i += 1;
+            } else if cmd_eq(args[i], b"LIMIT") && i + 2 < args.len() {
+                offset = Some(parse_u64(args[i + 1]).unwrap_or(0) as usize);
+                count = Some(parse_u64(args[i + 2]).unwrap_or(0) as usize);
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        if byscore {
+            let (min, min_ex) = parse_score_bound(arg_str(args[2]), false);
+            let (max, max_ex) = parse_score_bound(arg_str(args[3]), true);
+            match store.zrangebyscore(
+                args[1],
+                min,
+                max,
+                min_ex,
+                max_ex,
+                reverse,
+                offset,
+                count,
+                with_scores,
+                now,
+            ) {
+                Ok(items) => write_zset_result(out, &items, with_scores),
+                Err(e) => resp::write_error(out, &e),
+            }
+        } else if bylex {
+            match store.zrangebylex(
+                args[1],
+                arg_str(args[2]),
+                arg_str(args[3]),
+                offset,
+                count,
+                reverse,
+                now,
+            ) {
+                Ok(items) => {
+                    resp::write_array_header(out, items.len());
+                    for m in &items {
+                        resp::write_bulk(out, m);
+                    }
+                }
+                Err(e) => resp::write_error(out, &e),
+            }
+        } else {
+            let start = parse_i64(args[2]).unwrap_or(0);
+            let stop = parse_i64(args[3]).unwrap_or(-1);
+            match store.zrange(args[1], start, stop, reverse, with_scores, now) {
+                Ok(items) => write_zset_result(out, &items, with_scores),
+                Err(e) => resp::write_error(out, &e),
+            }
+        }
+    } else if cmd_eq(cmd, b"ZREVRANGE") {
+        if args.len() < 4 {
+            resp::write_error(out, "ERR wrong number of arguments for 'zrevrange' command");
+            return CmdResult::Written;
+        }
+        let with_scores = args.len() > 4 && cmd_eq(args[4], b"WITHSCORES");
+        let start = parse_i64(args[2]).unwrap_or(0);
+        let stop = parse_i64(args[3]).unwrap_or(-1);
+        match store.zrange(args[1], start, stop, true, with_scores, now) {
+            Ok(items) => write_zset_result(out, &items, with_scores),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZRANGEBYSCORE") {
+        if args.len() < 4 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'zrangebyscore' command",
+            );
+            return CmdResult::Written;
+        }
+        let (min, min_ex) = parse_score_bound(arg_str(args[2]), false);
+        let (max, max_ex) = parse_score_bound(arg_str(args[3]), true);
+        let mut with_scores = false;
+        let mut offset: Option<usize> = None;
+        let mut count: Option<usize> = None;
+        let mut i = 4;
+        while i < args.len() {
+            if cmd_eq(args[i], b"WITHSCORES") {
+                with_scores = true;
+                i += 1;
+            } else if cmd_eq(args[i], b"LIMIT") && i + 2 < args.len() {
+                offset = Some(parse_u64(args[i + 1]).unwrap_or(0) as usize);
+                count = Some(parse_u64(args[i + 2]).unwrap_or(0) as usize);
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        match store.zrangebyscore(
+            args[1],
+            min,
+            max,
+            min_ex,
+            max_ex,
+            false,
+            offset,
+            count,
+            with_scores,
+            now,
+        ) {
+            Ok(items) => write_zset_result(out, &items, with_scores),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZREVRANGEBYSCORE") {
+        if args.len() < 4 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'zrevrangebyscore' command",
+            );
+            return CmdResult::Written;
+        }
+        let (max, max_ex) = parse_score_bound(arg_str(args[2]), true);
+        let (min, min_ex) = parse_score_bound(arg_str(args[3]), false);
+        let mut with_scores = false;
+        let mut offset: Option<usize> = None;
+        let mut count: Option<usize> = None;
+        let mut i = 4;
+        while i < args.len() {
+            if cmd_eq(args[i], b"WITHSCORES") {
+                with_scores = true;
+                i += 1;
+            } else if cmd_eq(args[i], b"LIMIT") && i + 2 < args.len() {
+                offset = Some(parse_u64(args[i + 1]).unwrap_or(0) as usize);
+                count = Some(parse_u64(args[i + 2]).unwrap_or(0) as usize);
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        match store.zrangebyscore(
+            args[1],
+            min,
+            max,
+            min_ex,
+            max_ex,
+            true,
+            offset,
+            count,
+            with_scores,
+            now,
+        ) {
+            Ok(items) => write_zset_result(out, &items, with_scores),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZRANGEBYLEX") {
+        if args.len() < 4 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'zrangebylex' command",
+            );
+            return CmdResult::Written;
+        }
+        let mut offset: Option<usize> = None;
+        let mut count: Option<usize> = None;
+        let mut i = 4;
+        while i < args.len() {
+            if cmd_eq(args[i], b"LIMIT") && i + 2 < args.len() {
+                offset = Some(parse_u64(args[i + 1]).unwrap_or(0) as usize);
+                count = Some(parse_u64(args[i + 2]).unwrap_or(0) as usize);
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        match store.zrangebylex(
+            args[1],
+            arg_str(args[2]),
+            arg_str(args[3]),
+            offset,
+            count,
+            false,
+            now,
+        ) {
+            Ok(items) => {
+                resp::write_array_header(out, items.len());
+                for m in &items {
+                    resp::write_bulk(out, m);
+                }
+            }
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZREVRANGEBYLEX") {
+        if args.len() < 4 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'zrevrangebylex' command",
+            );
+            return CmdResult::Written;
+        }
+        let mut offset: Option<usize> = None;
+        let mut count: Option<usize> = None;
+        let mut i = 4;
+        while i < args.len() {
+            if cmd_eq(args[i], b"LIMIT") && i + 2 < args.len() {
+                offset = Some(parse_u64(args[i + 1]).unwrap_or(0) as usize);
+                count = Some(parse_u64(args[i + 2]).unwrap_or(0) as usize);
+                i += 3;
+            } else {
+                i += 1;
+            }
+        }
+        match store.zrangebylex(
+            args[1],
+            arg_str(args[3]),
+            arg_str(args[2]),
+            offset,
+            count,
+            true,
+            now,
+        ) {
+            Ok(items) => {
+                resp::write_array_header(out, items.len());
+                for m in &items {
+                    resp::write_bulk(out, m);
+                }
+            }
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZINCRBY") {
+        if args.len() != 4 {
+            resp::write_error(out, "ERR wrong number of arguments for 'zincrby' command");
+            return CmdResult::Written;
+        }
+        let increment: f64 = match arg_str(args[2]).parse() {
+            Ok(d) => d,
+            Err(_) => {
+                resp::write_error(out, "ERR value is not a valid float");
+                return CmdResult::Written;
+            }
+        };
+        match store.zincrby(args[1], args[3], increment, now) {
+            Ok(s) => {
+                let ss = format_float(s);
+                resp::write_bulk(out, &ss);
+            }
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZCOUNT") {
+        if args.len() != 4 {
+            resp::write_error(out, "ERR wrong number of arguments for 'zcount' command");
+            return CmdResult::Written;
+        }
+        let (min, min_ex) = parse_score_bound(arg_str(args[2]), false);
+        let (max, max_ex) = parse_score_bound(arg_str(args[3]), true);
+        match store.zcount(args[1], min, max, min_ex, max_ex, now) {
+            Ok(n) => resp::write_integer(out, n),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZPOPMIN") {
+        if args.len() < 2 {
+            resp::write_error(out, "ERR wrong number of arguments for 'zpopmin' command");
+            return CmdResult::Written;
+        }
+        let count = if args.len() > 2 {
+            parse_u64(args[2]).unwrap_or(1) as usize
+        } else {
+            1
+        };
+        match store.zpopmin(args[1], count, now) {
+            Ok(items) => {
+                if args.len() <= 2 && items.len() <= 1 {
+                    if items.is_empty() {
+                        resp::write_array_header(out, 0);
+                    } else {
+                        resp::write_array_header(out, 2);
+                        resp::write_bulk(out, &items[0].0);
+                        resp::write_bulk(out, &format_float(items[0].1));
+                    }
+                } else {
+                    resp::write_array_header(out, items.len() * 2);
+                    for (m, s) in &items {
+                        resp::write_bulk(out, m);
+                        resp::write_bulk(out, &format_float(*s));
+                    }
+                }
+            }
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZPOPMAX") {
+        if args.len() < 2 {
+            resp::write_error(out, "ERR wrong number of arguments for 'zpopmax' command");
+            return CmdResult::Written;
+        }
+        let count = if args.len() > 2 {
+            parse_u64(args[2]).unwrap_or(1) as usize
+        } else {
+            1
+        };
+        match store.zpopmax(args[1], count, now) {
+            Ok(items) => {
+                if args.len() <= 2 && items.len() <= 1 {
+                    if items.is_empty() {
+                        resp::write_array_header(out, 0);
+                    } else {
+                        resp::write_array_header(out, 2);
+                        resp::write_bulk(out, &items[0].0);
+                        resp::write_bulk(out, &format_float(items[0].1));
+                    }
+                } else {
+                    resp::write_array_header(out, items.len() * 2);
+                    for (m, s) in &items {
+                        resp::write_bulk(out, m);
+                        resp::write_bulk(out, &format_float(*s));
+                    }
+                }
+            }
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZUNIONSTORE") {
+        if args.len() < 4 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'zunionstore' command",
+            );
+            return CmdResult::Written;
+        }
+        let numkeys = parse_u64(args[2]).unwrap_or(0) as usize;
+        if 3 + numkeys > args.len() {
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
+        }
+        let keys: Vec<&[u8]> = args[3..3 + numkeys].to_vec();
+        let (weights, aggregate) = parse_zstore_options(&args[3 + numkeys..]);
+        match store.zunionstore(args[1], &keys, &weights, &aggregate, now) {
+            Ok(n) => resp::write_integer(out, n),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZINTERSTORE") {
+        if args.len() < 4 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'zinterstore' command",
+            );
+            return CmdResult::Written;
+        }
+        let numkeys = parse_u64(args[2]).unwrap_or(0) as usize;
+        if 3 + numkeys > args.len() {
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
+        }
+        let keys: Vec<&[u8]> = args[3..3 + numkeys].to_vec();
+        let (weights, aggregate) = parse_zstore_options(&args[3 + numkeys..]);
+        match store.zinterstore(args[1], &keys, &weights, &aggregate, now) {
+            Ok(n) => resp::write_integer(out, n),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZDIFFSTORE") {
+        if args.len() < 4 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'zdiffstore' command",
+            );
+            return CmdResult::Written;
+        }
+        let numkeys = parse_u64(args[2]).unwrap_or(0) as usize;
+        if 3 + numkeys > args.len() {
+            resp::write_error(out, "ERR syntax error");
+            return CmdResult::Written;
+        }
+        let keys: Vec<&[u8]> = args[3..3 + numkeys].to_vec();
+        match store.zdiffstore(args[1], &keys, now) {
+            Ok(n) => resp::write_integer(out, n),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZSCAN") {
+        if args.len() < 3 {
+            resp::write_error(out, "ERR wrong number of arguments for 'zscan' command");
+            return CmdResult::Written;
+        }
+        let cursor = parse_u64(args[2]).unwrap_or(0) as usize;
+        let mut count = 10usize;
+        let mut i = 3;
+        while i < args.len() {
+            if cmd_eq(args[i], b"COUNT") && i + 1 < args.len() {
+                count = parse_u64(args[i + 1]).unwrap_or(10) as usize;
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        let idx = store.shard_for_key(args[1]);
+        let shard = store.lock_read_shard(idx);
+        let ks = arg_str(args[1]);
+        match shard.data.get(ks) {
+            Some(entry) if !entry.is_expired_at(now) => {
+                if let StoreValue::SortedSet(tree, _) = &entry.value {
+                    let all: Vec<_> = tree.keys().collect();
+                    let s = cursor.min(all.len());
+                    let e = (s + count).min(all.len());
+                    let next = if e >= all.len() { 0 } else { e };
+                    resp::write_array_header(out, 2);
+                    resp::write_bulk(out, &next.to_string());
+                    resp::write_array_header(out, (e - s) * 2);
+                    for (score, member) in &all[s..e] {
+                        resp::write_bulk(out, member);
+                        resp::write_bulk(out, &format_float(score.0));
+                    }
+                } else {
+                    resp::write_error(
+                        out,
+                        "WRONGTYPE Operation against a key holding the wrong kind of value",
+                    );
+                }
+            }
+            _ => {
+                resp::write_array_header(out, 2);
+                resp::write_bulk(out, "0");
+                resp::write_array_header(out, 0);
+            }
+        }
+    } else if cmd_eq(cmd, b"ZMSCORE") {
+        if args.len() < 3 {
+            resp::write_error(out, "ERR wrong number of arguments for 'zmscore' command");
+            return CmdResult::Written;
+        }
+        let members: Vec<&[u8]> = args[2..].to_vec();
+        match store.zmscore(args[1], &members, now) {
+            Ok(scores) => {
+                resp::write_array_header(out, scores.len());
+                for s in &scores {
+                    match s {
+                        Some(v) => resp::write_bulk(out, &format_float(*v)),
+                        None => resp::write_null(out),
+                    }
+                }
+            }
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZLEXCOUNT") {
+        if args.len() != 4 {
+            resp::write_error(out, "ERR wrong number of arguments for 'zlexcount' command");
+            return CmdResult::Written;
+        }
+        match store.zrangebylex(
+            args[1],
+            arg_str(args[2]),
+            arg_str(args[3]),
+            None,
+            None,
+            false,
+            now,
+        ) {
+            Ok(items) => resp::write_integer(out, items.len() as i64),
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZREMRANGEBYRANK") {
+        if args.len() != 4 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'zremrangebyrank' command",
+            );
+            return CmdResult::Written;
+        }
+        let start = parse_i64(args[2]).unwrap_or(0);
+        let stop = parse_i64(args[3]).unwrap_or(-1);
+        match store.zrange(args[1], start, stop, false, true, now) {
+            Ok(items) => {
+                let members: Vec<&[u8]> = items.iter().map(|(m, _)| m.as_bytes()).collect();
+                match store.zrem(args[1], &members, now) {
+                    Ok(n) => resp::write_integer(out, n),
+                    Err(e) => resp::write_error(out, &e),
+                }
+            }
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZREMRANGEBYSCORE") {
+        if args.len() != 4 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'zremrangebyscore' command",
+            );
+            return CmdResult::Written;
+        }
+        let (min, min_ex) = parse_score_bound(arg_str(args[2]), false);
+        let (max, max_ex) = parse_score_bound(arg_str(args[3]), true);
+        match store.zrangebyscore(
+            args[1], min, max, min_ex, max_ex, false, None, None, true, now,
+        ) {
+            Ok(items) => {
+                let members: Vec<&[u8]> = items.iter().map(|(m, _)| m.as_bytes()).collect();
+                match store.zrem(args[1], &members, now) {
+                    Ok(n) => resp::write_integer(out, n),
+                    Err(e) => resp::write_error(out, &e),
+                }
+            }
+            Err(e) => resp::write_error(out, &e),
+        }
+    } else if cmd_eq(cmd, b"ZREMRANGEBYLEX") {
+        if args.len() != 4 {
+            resp::write_error(
+                out,
+                "ERR wrong number of arguments for 'zremrangebylex' command",
+            );
+            return CmdResult::Written;
+        }
+        match store.zrangebylex(
+            args[1],
+            arg_str(args[2]),
+            arg_str(args[3]),
+            None,
+            None,
+            false,
+            now,
+        ) {
+            Ok(items) => {
+                let members: Vec<&[u8]> = items.iter().map(|m| m.as_bytes()).collect();
+                match store.zrem(args[1], &members, now) {
+                    Ok(n) => resp::write_integer(out, n),
+                    Err(e) => resp::write_error(out, &e),
+                }
+            }
+            Err(e) => resp::write_error(out, &e),
+        }
     } else {
         resp::write_error(out, &format!("ERR unknown command '{}'", arg_str(cmd)));
     }
     CmdResult::Written
+}
+
+fn format_float(v: f64) -> String {
+    if v.fract() == 0.0 && v.abs() < 1e15 {
+        format!("{}", v as i64)
+    } else {
+        format!("{}", v)
+    }
+}
+
+fn parse_score_bound(s: &str, is_max: bool) -> (f64, bool) {
+    if s == "-inf" || s == "-" {
+        (f64::NEG_INFINITY, false)
+    } else if s == "+inf" || s == "+" {
+        (f64::INFINITY, false)
+    } else if let Some(rest) = s.strip_prefix('(') {
+        (
+            rest.parse::<f64>().unwrap_or(if is_max {
+                f64::INFINITY
+            } else {
+                f64::NEG_INFINITY
+            }),
+            true,
+        )
+    } else {
+        (
+            s.parse::<f64>().unwrap_or(if is_max {
+                f64::INFINITY
+            } else {
+                f64::NEG_INFINITY
+            }),
+            false,
+        )
+    }
+}
+
+fn parse_zstore_options(args: &[&[u8]]) -> (Vec<f64>, String) {
+    let mut weights = Vec::new();
+    let mut aggregate = "SUM".to_string();
+    let mut i = 0;
+    while i < args.len() {
+        if cmd_eq(args[i], b"WEIGHTS") {
+            i += 1;
+            while i < args.len() && !cmd_eq(args[i], b"AGGREGATE") {
+                weights.push(arg_str(args[i]).parse::<f64>().unwrap_or(1.0));
+                i += 1;
+            }
+        } else if cmd_eq(args[i], b"AGGREGATE") && i + 1 < args.len() {
+            aggregate = arg_str(args[i + 1]).to_uppercase();
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    (weights, aggregate)
+}
+
+fn write_zset_result(out: &mut BytesMut, items: &[(String, f64)], with_scores: bool) {
+    if with_scores {
+        resp::write_array_header(out, items.len() * 2);
+        for (m, s) in items {
+            resp::write_bulk(out, m);
+            resp::write_bulk(out, &format_float(*s));
+        }
+    } else {
+        resp::write_array_header(out, items.len());
+        for (m, _) in items {
+            resp::write_bulk(out, m);
+        }
+    }
 }
 
 fn build_info(store: &Store, _section: &str, now: Instant) -> String {
@@ -1666,4 +2381,144 @@ fn build_info(store: &Store, _section: &str, now: Instant) -> String {
         store.approximate_memory(),
         store.dbsize(now)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pubsub::Broker;
+    use crate::store::Store;
+    use std::time::Instant;
+
+    fn exec(store: &Store, args: &[&[u8]]) -> BytesMut {
+        let broker = Broker::new();
+        let mut out = BytesMut::new();
+        let now = Instant::now();
+        execute(store, &broker, args, &mut out, now);
+        out
+    }
+
+    fn exec_str(store: &Store, args: &[&[u8]]) -> String {
+        String::from_utf8_lossy(&exec(store, args)).to_string()
+    }
+
+    #[test]
+    fn set_wrong_arg_count() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"SET", b"key"]);
+        assert!(out.contains("ERR wrong number of arguments"));
+    }
+
+    #[test]
+    fn setex_negative_time() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"SETEX", b"key", b"-1", b"val"]);
+        assert!(out.contains("ERR invalid expire time"));
+    }
+
+    #[test]
+    fn incrbyfloat_nan_error() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"INCRBYFLOAT", b"key", b"nan"]);
+        assert!(out.contains("NaN or Infinity") || out.contains("not a valid float"));
+    }
+
+    #[test]
+    fn incrbyfloat_with_spaces() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"INCRBYFLOAT", b"key", b"1 2"]);
+        assert!(out.contains("not a valid float"));
+    }
+
+    #[test]
+    fn unknown_command_returns_error() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"NOTACMD"]);
+        assert!(out.contains("ERR unknown command"));
+    }
+
+    #[test]
+    fn auth_wrong_password() {
+        std::env::set_var("LUX_PASSWORD", "secret123");
+        let store = Store::new();
+        let out = exec_str(&store, &[b"AUTH", b"wrong"]);
+        assert!(out.contains("WRONGPASS"));
+        std::env::remove_var("LUX_PASSWORD");
+    }
+
+    #[test]
+    fn getex_syntax_error() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"GETEX", b"key", b"BADOPT"]);
+        assert!(out.contains("ERR syntax error"));
+    }
+
+    #[test]
+    fn ping_returns_pong() {
+        let store = Store::new();
+        let out = exec(&store, &[b"PING"]);
+        assert_eq!(&out[..], b"+PONG\r\n");
+    }
+
+    #[test]
+    fn ping_with_message() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"PING", b"hello"]);
+        assert!(out.contains("hello"));
+    }
+
+    #[test]
+    fn echo_returns_argument() {
+        let store = Store::new();
+        let out = exec_str(&store, &[b"ECHO", b"test"]);
+        assert!(out.contains("test"));
+    }
+
+    #[test]
+    fn set_then_get() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"mykey", b"myval"]);
+        let out = exec_str(&store, &[b"GET", b"mykey"]);
+        assert!(out.contains("myval"));
+    }
+
+    #[test]
+    fn del_returns_count() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"a", b"1"]);
+        exec(&store, &[b"SET", b"b", b"2"]);
+        let out = exec(&store, &[b"DEL", b"a", b"b", b"c"]);
+        assert!(out.starts_with(b":2\r\n"));
+    }
+
+    #[test]
+    fn zadd_and_zscore() {
+        let store = Store::new();
+        exec(&store, &[b"ZADD", b"zs", b"1.5", b"alice"]);
+        let out = exec_str(&store, &[b"ZSCORE", b"zs", b"alice"]);
+        assert!(out.contains("1") || out.contains("1.5"));
+    }
+
+    #[test]
+    fn zadd_nx_flag() {
+        let store = Store::new();
+        exec(&store, &[b"ZADD", b"zs", b"1", b"a"]);
+        exec(&store, &[b"ZADD", b"zs", b"NX", b"2", b"a"]);
+        let score = store.zscore(b"zs", b"a", Instant::now()).unwrap().unwrap();
+        assert!((score - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn type_returns_correct_type() {
+        let store = Store::new();
+        exec(&store, &[b"SET", b"s", b"val"]);
+        exec(&store, &[b"LPUSH", b"l", b"val"]);
+        exec(&store, &[b"SADD", b"set", b"val"]);
+        exec(&store, &[b"ZADD", b"zs", b"1", b"val"]);
+        assert!(exec_str(&store, &[b"TYPE", b"s"]).contains("string"));
+        assert!(exec_str(&store, &[b"TYPE", b"l"]).contains("list"));
+        assert!(exec_str(&store, &[b"TYPE", b"set"]).contains("set"));
+        assert!(exec_str(&store, &[b"TYPE", b"zs"]).contains("zset"));
+        assert!(exec_str(&store, &[b"TYPE", b"missing"]).contains("none"));
+    }
 }

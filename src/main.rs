@@ -275,6 +275,9 @@ async fn handle_connection(
                         || cmd_eq_fast(args[0], b"SUNION")
                         || cmd_eq_fast(args[0], b"SINTER")
                         || cmd_eq_fast(args[0], b"SDIFF")
+                        || cmd_eq_fast(args[0], b"ZUNIONSTORE")
+                        || cmd_eq_fast(args[0], b"ZINTERSTORE")
+                        || cmd_eq_fast(args[0], b"ZDIFFSTORE")
                     {
                         all_single_key_rw = false;
                     }
@@ -314,86 +317,99 @@ async fn handle_connection(
                         }
                     }
                 } else {
-                    let mut sorted: Vec<(u32, u32)> = Vec::with_capacity(cmd_count);
-                    for (i, args) in commands.iter().enumerate() {
-                        sorted.push((store.shard_for_key(args[1]) as u32, i as u32));
+                    const IS_SIMPLE_SET: u8 = 1;
+                    const IS_SIMPLE_GET: u8 = 2;
+
+                    let mut shards: Vec<u32> = Vec::with_capacity(cmd_count);
+                    let mut flags: Vec<u8> = Vec::with_capacity(cmd_count);
+                    for args in &commands {
+                        shards.push(store.shard_for_key(args[1]) as u32);
+                        flags.push(if cmd_eq_fast(args[0], b"SET") && args.len() == 3 {
+                            IS_SIMPLE_SET
+                        } else if cmd_eq_fast(args[0], b"GET") && args.len() == 2 {
+                            IS_SIMPLE_GET
+                        } else {
+                            0
+                        });
                     }
-                    sorted.sort_unstable_by_key(|&(shard, _)| shard);
 
-                    let mut scratch = BytesMut::with_capacity(cmd_count * 32);
-                    let mut resp_spans: Vec<(u32, u32)> = vec![(0, 0); cmd_count];
-
-                    let mut batch_start = 0usize;
-                    while batch_start < sorted.len() {
-                        let shard_idx = sorted[batch_start].0;
-                        let mut batch_end = batch_start + 1;
-                        while batch_end < sorted.len() && sorted[batch_end].0 == shard_idx {
+                    let mut i = 0usize;
+                    while i < cmd_count {
+                        let shard_idx = shards[i];
+                        let mut batch_end = i + 1;
+                        while batch_end < cmd_count && shards[batch_end] == shard_idx {
                             batch_end += 1;
                         }
 
-                        let all_simple = sorted[batch_start..batch_end].iter().all(|&(_, ci)| {
-                            let c = commands[ci as usize][0];
-                            (cmd_eq_fast(c, b"SET") && commands[ci as usize].len() == 3)
-                                || (cmd_eq_fast(c, b"GET") && commands[ci as usize].len() == 2)
-                        });
-
-                        if all_simple {
-                            let has_writes = sorted[batch_start..batch_end]
-                                .iter()
-                                .any(|&(_, ci)| cmd_eq_fast(commands[ci as usize][0], b"SET"));
-                            if has_writes {
+                        if batch_end == i + 1 {
+                            let f = flags[i];
+                            if f == IS_SIMPLE_SET {
                                 let mut shard = store.lock_write_shard(shard_idx as usize);
-                                for &(_, ci) in &sorted[batch_start..batch_end] {
-                                    let idx = ci as usize;
-                                    let args = &commands[idx];
-                                    let start = scratch.len() as u32;
-                                    if cmd_eq_fast(args[0], b"SET") {
-                                        Store::set_on_shard(
-                                            &mut shard.data,
-                                            args[1],
-                                            args[2],
-                                            None,
-                                            now,
-                                        );
-                                        scratch.extend_from_slice(resp::OK);
-                                    } else {
+                                Store::set_on_shard(
+                                    &mut shard.data,
+                                    commands[i][1],
+                                    commands[i][2],
+                                    None,
+                                    now,
+                                );
+                                write_buf.extend_from_slice(resp::OK);
+                            } else if f == IS_SIMPLE_GET {
+                                let shard = store.lock_read_shard(shard_idx as usize);
+                                Store::get_and_write(
+                                    &shard.data,
+                                    commands[i][1],
+                                    now,
+                                    &mut write_buf,
+                                );
+                            } else {
+                                cmd::execute(&store, &broker, &commands[i], &mut write_buf, now);
+                            }
+                        } else {
+                            let all_simple = flags[i..batch_end].iter().all(|&f| f != 0);
+                            if all_simple {
+                                let has_writes = flags[i..batch_end].contains(&IS_SIMPLE_SET);
+                                if has_writes {
+                                    let mut shard = store.lock_write_shard(shard_idx as usize);
+                                    for (&f, args) in
+                                        flags[i..batch_end].iter().zip(&commands[i..batch_end])
+                                    {
+                                        if f == IS_SIMPLE_SET {
+                                            Store::set_on_shard(
+                                                &mut shard.data,
+                                                args[1],
+                                                args[2],
+                                                None,
+                                                now,
+                                            );
+                                            write_buf.extend_from_slice(resp::OK);
+                                        } else {
+                                            Store::get_and_write(
+                                                &shard.data,
+                                                args[1],
+                                                now,
+                                                &mut write_buf,
+                                            );
+                                        }
+                                    }
+                                } else {
+                                    let shard = store.lock_read_shard(shard_idx as usize);
+                                    for args in &commands[i..batch_end] {
                                         Store::get_and_write(
                                             &shard.data,
                                             args[1],
                                             now,
-                                            &mut scratch,
+                                            &mut write_buf,
                                         );
                                     }
-                                    resp_spans[idx] = (start, scratch.len() as u32);
                                 }
                             } else {
-                                let shard = store.lock_read_shard(shard_idx as usize);
-                                for &(_, ci) in &sorted[batch_start..batch_end] {
-                                    let idx = ci as usize;
-                                    let start = scratch.len() as u32;
-                                    Store::get_and_write(
-                                        &shard.data,
-                                        commands[idx][1],
-                                        now,
-                                        &mut scratch,
-                                    );
-                                    resp_spans[idx] = (start, scratch.len() as u32);
+                                for args in &commands[i..batch_end] {
+                                    cmd::execute(&store, &broker, args, &mut write_buf, now);
                                 }
-                            }
-                        } else {
-                            for &(_, ci) in &sorted[batch_start..batch_end] {
-                                let idx = ci as usize;
-                                let start = scratch.len() as u32;
-                                cmd::execute(&store, &broker, &commands[idx], &mut scratch, now);
-                                resp_spans[idx] = (start, scratch.len() as u32);
                             }
                         }
 
-                        batch_start = batch_end;
-                    }
-
-                    for &(start, end) in &resp_spans {
-                        write_buf.extend_from_slice(&scratch[start as usize..end as usize]);
+                        i = batch_end;
                     }
                 }
             }

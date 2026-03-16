@@ -1,7 +1,8 @@
 use bytes::Bytes;
 use hashbrown::HashMap;
+use ordered_float::OrderedFloat;
 use parking_lot::RwLock;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::time::{Duration, Instant};
 
@@ -44,10 +45,11 @@ pub fn num_shards() -> usize {
                 let cpus = std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(4);
-                (cpus * 16).next_power_of_two().max(16).min(1024)
+                (cpus * 16).next_power_of_two().clamp(16, 1024)
             })
     })
 }
+#[allow(dead_code)]
 pub const MAX_SHARDS: usize = 1024;
 
 pub enum StoreValue {
@@ -55,6 +57,10 @@ pub enum StoreValue {
     List(VecDeque<Bytes>),
     Hash(HashMap<String, Bytes>),
     Set(HashSet<String>),
+    SortedSet(
+        BTreeMap<(OrderedFloat<f64>, String), ()>,
+        HashMap<String, f64>,
+    ),
 }
 
 impl StoreValue {
@@ -64,6 +70,7 @@ impl StoreValue {
             StoreValue::List(_) => "list",
             StoreValue::Hash(_) => "hash",
             StoreValue::Set(_) => "set",
+            StoreValue::SortedSet(..) => "zset",
         }
     }
 }
@@ -76,7 +83,7 @@ pub struct Entry {
 impl Entry {
     #[inline(always)]
     pub fn is_expired_at(&self, now: Instant) -> bool {
-        self.expires_at.map_or(false, |exp| now > exp)
+        self.expires_at.is_some_and(|exp| now > exp)
     }
 }
 
@@ -391,7 +398,7 @@ impl Store {
         for shard in self.shards.iter() {
             let shard = shard.read();
             for (k, e) in shard.data.iter() {
-                if e.expires_at.map_or(true, |exp| now < exp) && matcher.matches(k) {
+                if e.expires_at.is_none_or(|exp| now < exp) && matcher.matches(k) {
                     result.push(k.clone());
                 }
             }
@@ -507,7 +514,7 @@ impl Store {
             total += shard
                 .data
                 .values()
-                .filter(|e| e.expires_at.map_or(true, |exp| now < exp))
+                .filter(|e| e.expires_at.is_none_or(|exp| now < exp))
                 .count() as i64;
         }
         total
@@ -1010,6 +1017,9 @@ impl Store {
                     StoreValue::List(l) => l.iter().map(|b| b.len() + 32).sum(),
                     StoreValue::Hash(h) => h.iter().map(|(k, v)| k.len() + v.len() + 64).sum(),
                     StoreValue::Set(s) => s.iter().map(|m| m.len() + 32).sum(),
+                    StoreValue::SortedSet(_, scores) => {
+                        scores.iter().map(|(m, _)| m.len() + 48).sum()
+                    }
                 };
             }
         }
@@ -1045,6 +1055,9 @@ impl Store {
                                 .collect(),
                         ),
                         StoreValue::Set(s) => DumpValue::Set(s.iter().cloned().collect()),
+                        StoreValue::SortedSet(_, scores) => DumpValue::SortedSet(
+                            scores.iter().map(|(m, s)| (m.clone(), *s)).collect(),
+                        ),
                     },
                     ttl_ms,
                 });
@@ -1063,6 +1076,15 @@ impl Store {
                 StoreValue::Hash(h.into_iter().map(|(k, v)| (k, Bytes::from(v))).collect())
             }
             DumpValue::Set(s) => StoreValue::Set(s.into_iter().collect()),
+            DumpValue::SortedSet(members) => {
+                let mut tree = BTreeMap::new();
+                let mut scores = HashMap::new();
+                for (member, score) in members {
+                    tree.insert((OrderedFloat(score), member.clone()), ());
+                    scores.insert(member, score);
+                }
+                StoreValue::SortedSet(tree, scores)
+            }
         };
         let expires_at = ttl.map(|d| Instant::now() + d);
         shard.data.insert(
@@ -1696,6 +1718,625 @@ impl Store {
         Ok(result.len() as i64)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn zadd(
+        &self,
+        key: &[u8],
+        members: &[(&[u8], f64)],
+        nx: bool,
+        xx: bool,
+        gt: bool,
+        lt: bool,
+        ch: bool,
+        now: Instant,
+    ) -> Result<i64, String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        let ks = key_string(key);
+        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
+            value: StoreValue::SortedSet(BTreeMap::new(), HashMap::new()),
+            expires_at: None,
+        });
+        if entry.is_expired_at(now) {
+            entry.value = StoreValue::SortedSet(BTreeMap::new(), HashMap::new());
+            entry.expires_at = None;
+        }
+        match &mut entry.value {
+            StoreValue::SortedSet(tree, scores) => {
+                let mut added = 0i64;
+                let mut changed = 0i64;
+                for &(member, score) in members {
+                    let ms = key_string(member);
+                    if let Some(&old_score) = scores.get(&ms) {
+                        if nx {
+                            continue;
+                        }
+                        let update = if gt && lt {
+                            score != old_score
+                        } else if gt {
+                            score > old_score
+                        } else if lt {
+                            score < old_score
+                        } else {
+                            true
+                        };
+                        if update && score != old_score {
+                            tree.remove(&(OrderedFloat(old_score), ms.clone()));
+                            tree.insert((OrderedFloat(score), ms.clone()), ());
+                            scores.insert(ms, score);
+                            changed += 1;
+                        }
+                    } else {
+                        if xx {
+                            continue;
+                        }
+                        tree.insert((OrderedFloat(score), ms.clone()), ());
+                        scores.insert(ms, score);
+                        added += 1;
+                    }
+                }
+                Ok(if ch { added + changed } else { added })
+            }
+            _ => {
+                Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+            }
+        }
+    }
+
+    pub fn zscore(&self, key: &[u8], member: &[u8], now: Instant) -> Result<Option<f64>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(_, scores) => Ok(scores.get(key_str(member)).copied()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    pub fn zrank(
+        &self,
+        key: &[u8],
+        member: &[u8],
+        reverse: bool,
+        now: Instant,
+    ) -> Result<Option<i64>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(tree, scores) => {
+                    let ms = key_str(member);
+                    match scores.get(ms) {
+                        Some(&score) => {
+                            let key = (OrderedFloat(score), ms.to_string());
+                            let forward_rank = tree.range(..&key).count();
+                            if reverse {
+                                Ok(Some((tree.len() - 1 - forward_rank) as i64))
+                            } else {
+                                Ok(Some(forward_rank as i64))
+                            }
+                        }
+                        None => Ok(None),
+                    }
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    pub fn zrem(&self, key: &[u8], members: &[&[u8]], now: Instant) -> Result<i64, String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        match shard.data.get_mut(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
+                StoreValue::SortedSet(tree, scores) => {
+                    let mut removed = 0i64;
+                    for m in members {
+                        let ms = key_str(m);
+                        if let Some(score) = scores.remove(ms) {
+                            tree.remove(&(OrderedFloat(score), ms.to_string()));
+                            removed += 1;
+                        }
+                    }
+                    Ok(removed)
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(0),
+        }
+    }
+
+    pub fn zcard(&self, key: &[u8], now: Instant) -> Result<i64, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(_, scores) => Ok(scores.len() as i64),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(0),
+        }
+    }
+
+    pub fn zrange(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+        reverse: bool,
+        _with_scores: bool,
+        now: Instant,
+    ) -> Result<Vec<(String, f64)>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(tree, _) => {
+                    let len = tree.len() as i64;
+                    let s = if start < 0 {
+                        (len + start).max(0) as usize
+                    } else {
+                        start.min(len) as usize
+                    };
+                    let e = if stop < 0 {
+                        (len + stop + 1).max(0) as usize
+                    } else {
+                        (stop + 1).min(len) as usize
+                    };
+                    if s >= e {
+                        return Ok(vec![]);
+                    }
+                    let items: Vec<(String, f64)> = if reverse {
+                        tree.keys()
+                            .rev()
+                            .skip(s)
+                            .take(e - s)
+                            .map(|(score, member)| (member.clone(), score.0))
+                            .collect()
+                    } else {
+                        tree.keys()
+                            .skip(s)
+                            .take(e - s)
+                            .map(|(score, member)| (member.clone(), score.0))
+                            .collect()
+                    };
+                    Ok(items)
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(vec![]),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn zrangebyscore(
+        &self,
+        key: &[u8],
+        min: f64,
+        max: f64,
+        min_exclusive: bool,
+        max_exclusive: bool,
+        reverse: bool,
+        offset: Option<usize>,
+        count: Option<usize>,
+        _with_scores: bool,
+        now: Instant,
+    ) -> Result<Vec<(String, f64)>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(tree, _) => {
+                    let range_start = (OrderedFloat(min), String::new());
+                    let range_end = (
+                        OrderedFloat(max),
+                        "\u{ffff}\u{ffff}\u{ffff}\u{ffff}".to_string(),
+                    );
+                    let iter = tree.range(range_start..=range_end);
+                    let filtered: Vec<(String, f64)> = if reverse {
+                        iter.rev()
+                            .filter(|((s, _), _)| {
+                                let sv = s.0;
+                                let lo = if min_exclusive { sv > min } else { sv >= min };
+                                let hi = if max_exclusive { sv < max } else { sv <= max };
+                                lo && hi
+                            })
+                            .map(|((s, m), _)| (m.clone(), s.0))
+                            .collect()
+                    } else {
+                        iter.filter(|((s, _), _)| {
+                            let sv = s.0;
+                            let lo = if min_exclusive { sv > min } else { sv >= min };
+                            let hi = if max_exclusive { sv < max } else { sv <= max };
+                            lo && hi
+                        })
+                        .map(|((s, m), _)| (m.clone(), s.0))
+                        .collect()
+                    };
+                    let off = offset.unwrap_or(0);
+                    let cnt = count.unwrap_or(filtered.len());
+                    Ok(filtered.into_iter().skip(off).take(cnt).collect())
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(vec![]),
+        }
+    }
+
+    pub fn zincrby(
+        &self,
+        key: &[u8],
+        member: &[u8],
+        increment: f64,
+        now: Instant,
+    ) -> Result<f64, String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        let ks = key_string(key);
+        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
+            value: StoreValue::SortedSet(BTreeMap::new(), HashMap::new()),
+            expires_at: None,
+        });
+        if entry.is_expired_at(now) {
+            entry.value = StoreValue::SortedSet(BTreeMap::new(), HashMap::new());
+            entry.expires_at = None;
+        }
+        match &mut entry.value {
+            StoreValue::SortedSet(tree, scores) => {
+                let ms = key_string(member);
+                let old = scores.get(&ms).copied().unwrap_or(0.0);
+                let new_score = old + increment;
+                if old != 0.0 || scores.contains_key(&ms) {
+                    tree.remove(&(OrderedFloat(old), ms.clone()));
+                }
+                tree.insert((OrderedFloat(new_score), ms.clone()), ());
+                scores.insert(ms, new_score);
+                Ok(new_score)
+            }
+            _ => {
+                Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+            }
+        }
+    }
+
+    pub fn zcount(
+        &self,
+        key: &[u8],
+        min: f64,
+        max: f64,
+        min_exclusive: bool,
+        max_exclusive: bool,
+        now: Instant,
+    ) -> Result<i64, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(tree, _) => {
+                    let range_start = (OrderedFloat(min), String::new());
+                    let range_end = (
+                        OrderedFloat(max),
+                        "\u{ffff}\u{ffff}\u{ffff}\u{ffff}".to_string(),
+                    );
+                    let count = tree
+                        .range(range_start..=range_end)
+                        .filter(|((s, _), _)| {
+                            let sv = s.0;
+                            let lo = if min_exclusive { sv > min } else { sv >= min };
+                            let hi = if max_exclusive { sv < max } else { sv <= max };
+                            lo && hi
+                        })
+                        .count();
+                    Ok(count as i64)
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(0),
+        }
+    }
+
+    pub fn zpopmin(
+        &self,
+        key: &[u8],
+        count: usize,
+        now: Instant,
+    ) -> Result<Vec<(String, f64)>, String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        match shard.data.get_mut(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
+                StoreValue::SortedSet(tree, scores) => {
+                    let mut result = Vec::new();
+                    for _ in 0..count {
+                        if let Some(((score, member), _)) = tree.pop_first() {
+                            scores.remove(&member);
+                            result.push((member, score.0));
+                        } else {
+                            break;
+                        }
+                    }
+                    Ok(result)
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(vec![]),
+        }
+    }
+
+    pub fn zpopmax(
+        &self,
+        key: &[u8],
+        count: usize,
+        now: Instant,
+    ) -> Result<Vec<(String, f64)>, String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        match shard.data.get_mut(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
+                StoreValue::SortedSet(tree, scores) => {
+                    let mut result = Vec::new();
+                    for _ in 0..count {
+                        if let Some(((score, member), _)) = tree.pop_last() {
+                            scores.remove(&member);
+                            result.push((member, score.0));
+                        } else {
+                            break;
+                        }
+                    }
+                    Ok(result)
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(vec![]),
+        }
+    }
+
+    fn collect_sorted_set(&self, key: &[u8], now: Instant) -> Result<HashMap<String, f64>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(_, scores) => Ok(scores.clone()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(HashMap::new()),
+        }
+    }
+
+    pub fn zunionstore(
+        &self,
+        dst: &[u8],
+        keys: &[&[u8]],
+        weights: &[f64],
+        aggregate: &str,
+        now: Instant,
+    ) -> Result<i64, String> {
+        let mut result: HashMap<String, f64> = HashMap::new();
+        for (i, key) in keys.iter().enumerate() {
+            let w = weights.get(i).copied().unwrap_or(1.0);
+            let set = self.collect_sorted_set(key, now)?;
+            for (member, score) in set {
+                let weighted = score * w;
+                let entry = result.entry(member).or_insert(0.0);
+                match aggregate {
+                    "MIN" => *entry = entry.min(weighted),
+                    "MAX" => *entry = entry.max(weighted),
+                    _ => *entry += weighted,
+                }
+            }
+        }
+        let count = result.len() as i64;
+        self.del(&[dst]);
+        if !result.is_empty() {
+            let idx = self.shard_index(dst);
+            let mut shard = self.shards[idx].write();
+            let mut tree = BTreeMap::new();
+            let mut scores = HashMap::new();
+            for (member, score) in result {
+                tree.insert((OrderedFloat(score), member.clone()), ());
+                scores.insert(member, score);
+            }
+            shard.data.insert(
+                key_string(dst),
+                Entry {
+                    value: StoreValue::SortedSet(tree, scores),
+                    expires_at: None,
+                },
+            );
+        }
+        Ok(count)
+    }
+
+    pub fn zinterstore(
+        &self,
+        dst: &[u8],
+        keys: &[&[u8]],
+        weights: &[f64],
+        aggregate: &str,
+        now: Instant,
+    ) -> Result<i64, String> {
+        if keys.is_empty() {
+            self.del(&[dst]);
+            return Ok(0);
+        }
+        let first = self.collect_sorted_set(keys[0], now)?;
+        let w0 = weights.first().copied().unwrap_or(1.0);
+        let mut result: HashMap<String, f64> =
+            first.into_iter().map(|(m, s)| (m, s * w0)).collect();
+        for (i, key) in keys[1..].iter().enumerate() {
+            let w = weights.get(i + 1).copied().unwrap_or(1.0);
+            let set = self.collect_sorted_set(key, now)?;
+            result.retain(|member, current| {
+                if let Some(&score) = set.get(member) {
+                    let weighted = score * w;
+                    match aggregate {
+                        "MIN" => *current = current.min(weighted),
+                        "MAX" => *current = current.max(weighted),
+                        _ => *current += weighted,
+                    }
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+        let count = result.len() as i64;
+        self.del(&[dst]);
+        if !result.is_empty() {
+            let idx = self.shard_index(dst);
+            let mut shard = self.shards[idx].write();
+            let mut tree = BTreeMap::new();
+            let mut scores = HashMap::new();
+            for (member, score) in result {
+                tree.insert((OrderedFloat(score), member.clone()), ());
+                scores.insert(member, score);
+            }
+            shard.data.insert(
+                key_string(dst),
+                Entry {
+                    value: StoreValue::SortedSet(tree, scores),
+                    expires_at: None,
+                },
+            );
+        }
+        Ok(count)
+    }
+
+    pub fn zdiffstore(&self, dst: &[u8], keys: &[&[u8]], now: Instant) -> Result<i64, String> {
+        if keys.is_empty() {
+            self.del(&[dst]);
+            return Ok(0);
+        }
+        let mut result = self.collect_sorted_set(keys[0], now)?;
+        for key in &keys[1..] {
+            let set = self.collect_sorted_set(key, now)?;
+            result.retain(|m, _| !set.contains_key(m));
+        }
+        let count = result.len() as i64;
+        self.del(&[dst]);
+        if !result.is_empty() {
+            let idx = self.shard_index(dst);
+            let mut shard = self.shards[idx].write();
+            let mut tree = BTreeMap::new();
+            let mut scores = HashMap::new();
+            for (member, score) in result {
+                tree.insert((OrderedFloat(score), member.clone()), ());
+                scores.insert(member, score);
+            }
+            shard.data.insert(
+                key_string(dst),
+                Entry {
+                    value: StoreValue::SortedSet(tree, scores),
+                    expires_at: None,
+                },
+            );
+        }
+        Ok(count)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn zrangebylex(
+        &self,
+        key: &[u8],
+        min: &str,
+        max: &str,
+        offset: Option<usize>,
+        count: Option<usize>,
+        reverse: bool,
+        now: Instant,
+    ) -> Result<Vec<String>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(tree, _) => {
+                    let all: Vec<&String> = if reverse {
+                        tree.keys().rev().map(|(_, m)| m).collect()
+                    } else {
+                        tree.keys().map(|(_, m)| m).collect()
+                    };
+                    let filtered: Vec<String> = all
+                        .into_iter()
+                        .filter(|m| {
+                            let lo = if min == "-" {
+                                true
+                            } else if min.starts_with('(') {
+                                m.as_str() > &min[1..]
+                            } else if min.starts_with('[') {
+                                m.as_str() >= &min[1..]
+                            } else {
+                                m.as_str() >= min
+                            };
+                            let hi = if max == "+" {
+                                true
+                            } else if max.starts_with('(') {
+                                m.as_str() < &max[1..]
+                            } else if max.starts_with('[') {
+                                m.as_str() <= &max[1..]
+                            } else {
+                                m.as_str() <= max
+                            };
+                            lo && hi
+                        })
+                        .cloned()
+                        .collect();
+                    let off = offset.unwrap_or(0);
+                    let cnt = count.unwrap_or(filtered.len());
+                    Ok(filtered.into_iter().skip(off).take(cnt).collect())
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(vec![]),
+        }
+    }
+
+    pub fn zmscore(
+        &self,
+        key: &[u8],
+        members: &[&[u8]],
+        now: Instant,
+    ) -> Result<Vec<Option<f64>>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::SortedSet(_, scores) => Ok(members
+                    .iter()
+                    .map(|m| scores.get(key_str(m)).copied())
+                    .collect()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(members.iter().map(|_| None).collect()),
+        }
+    }
+
     pub fn expire_sweep(&self, now: Instant) {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -1717,7 +2358,7 @@ impl Store {
                 .data
                 .keys()
                 .enumerate()
-                .filter(|(j, _)| (*j + seed + i) % 5 == 0)
+                .filter(|(j, _)| (*j + seed + i).is_multiple_of(5))
                 .take(20)
                 .map(|(_, k)| k.clone())
                 .collect();
@@ -1737,6 +2378,7 @@ pub enum DumpValue {
     List(Vec<String>),
     Hash(Vec<(String, String)>),
     Set(Vec<String>),
+    SortedSet(Vec<(String, f64)>),
 }
 
 pub struct DumpEntry {
@@ -1788,4 +2430,956 @@ impl GlobMatcher {
         false
     }
 }
-// appended at module level - will need to be moved inside impl Store
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn now() -> Instant {
+        Instant::now()
+    }
+
+    #[test]
+    fn set_get_roundtrip() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"key1", b"value1", None, n);
+        assert_eq!(store.get(b"key1", n).unwrap(), &b"value1"[..]);
+    }
+
+    #[test]
+    fn set_with_ttl_expires() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"key1", b"val", Some(Duration::from_millis(1)), n);
+        assert!(store.get(b"key1", n).is_some());
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(store.get(b"key1", Instant::now()).is_none());
+    }
+
+    #[test]
+    fn incr_nonexistent_creates_one() {
+        let store = Store::new();
+        let n = now();
+        let result = store.incr(b"counter", 1, n).unwrap();
+        assert_eq!(result, 1);
+        assert_eq!(store.get(b"counter", n).unwrap(), &b"1"[..]);
+    }
+
+    #[test]
+    fn incr_then_get() {
+        let store = Store::new();
+        let n = now();
+        store.incr(b"counter", 1, n).unwrap();
+        store.incr(b"counter", 1, n).unwrap();
+        store.incr(b"counter", 1, n).unwrap();
+        let val = store.get(b"counter", n).unwrap();
+        assert_eq!(val, &b"3"[..]);
+    }
+
+    #[test]
+    fn set_ex_then_ttl() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"key1", b"val", Some(Duration::from_secs(100)), n);
+        let ttl = store.ttl(b"key1", n);
+        assert!(ttl > 0 && ttl <= 100);
+    }
+
+    #[test]
+    fn decrby_overflow() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"key", format!("{}", i64::MIN).as_bytes(), None, n);
+        let result = store.incr(b"key", -1, n);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn list_push_pop() {
+        let store = Store::new();
+        let n = now();
+        store.lpush(b"list", &[b"a", b"b", b"c"], n).unwrap();
+        assert_eq!(store.llen(b"list", n).unwrap(), 3);
+        assert_eq!(store.lpop(b"list", n).unwrap(), &b"c"[..]);
+        assert_eq!(store.rpop(b"list", n).unwrap(), &b"a"[..]);
+    }
+
+    #[test]
+    fn hash_operations() {
+        let store = Store::new();
+        let n = now();
+        store
+            .hset(
+                b"myhash",
+                &[(b"f1" as &[u8], b"v1" as &[u8]), (b"f2", b"v2")],
+                n,
+            )
+            .unwrap();
+        assert_eq!(store.hget(b"myhash", b"f1", n).unwrap(), &b"v1"[..]);
+        assert_eq!(store.hlen(b"myhash", n).unwrap(), 2);
+        store.hdel(b"myhash", &[b"f1"], n).unwrap();
+        assert_eq!(store.hlen(b"myhash", n).unwrap(), 1);
+    }
+
+    #[test]
+    fn set_operations() {
+        let store = Store::new();
+        let n = now();
+        store.sadd(b"s1", &[b"a", b"b", b"c"], n).unwrap();
+        store.sadd(b"s2", &[b"b", b"c", b"d"], n).unwrap();
+        assert_eq!(store.scard(b"s1", n).unwrap(), 3);
+        assert!(store.sismember(b"s1", b"a", n).unwrap());
+        assert!(!store.sismember(b"s1", b"d", n).unwrap());
+    }
+
+    #[test]
+    fn del_removes_key() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"key1", b"val", None, n);
+        assert_eq!(store.del(&[b"key1"]), 1);
+        assert!(store.get(b"key1", n).is_none());
+    }
+
+    #[test]
+    fn exists_checks_key() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"key1", b"val", None, n);
+        assert_eq!(store.exists(&[b"key1"], n), 1);
+        assert_eq!(store.exists(&[b"missing"], n), 0);
+    }
+
+    #[test]
+    fn rename_key() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"old", b"val", None, n);
+        store.rename(b"old", b"new", n).unwrap();
+        assert!(store.get(b"old", n).is_none());
+        assert_eq!(store.get(b"new", n).unwrap(), &b"val"[..]);
+    }
+
+    #[test]
+    fn fx_hash_consistency() {
+        let h1 = fx_hash(b"hello");
+        let h2 = fx_hash(b"hello");
+        assert_eq!(h1, h2);
+        let h3 = fx_hash(b"world");
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn sorted_set_zadd_zscore() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"zs",
+                &[(b"alice" as &[u8], 1.0), (b"bob", 2.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        assert_eq!(store.zscore(b"zs", b"alice", n).unwrap(), Some(1.0));
+        assert_eq!(store.zscore(b"zs", b"bob", n).unwrap(), Some(2.0));
+        assert_eq!(store.zcard(b"zs", n).unwrap(), 2);
+    }
+
+    #[test]
+    fn sorted_set_zrank() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"zs",
+                &[(b"a" as &[u8], 1.0), (b"b", 2.0), (b"c", 3.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        assert_eq!(store.zrank(b"zs", b"a", false, n).unwrap(), Some(0));
+        assert_eq!(store.zrank(b"zs", b"c", false, n).unwrap(), Some(2));
+        assert_eq!(store.zrank(b"zs", b"c", true, n).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn sorted_set_zrange() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"zs",
+                &[(b"a" as &[u8], 1.0), (b"b", 2.0), (b"c", 3.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        let items = store.zrange(b"zs", 0, -1, false, true, n).unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].0, "a");
+        assert_eq!(items[2].0, "c");
+    }
+
+    #[test]
+    fn sorted_set_zrem() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"zs",
+                &[(b"a" as &[u8], 1.0), (b"b", 2.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        assert_eq!(store.zrem(b"zs", &[b"a"], n).unwrap(), 1);
+        assert_eq!(store.zcard(b"zs", n).unwrap(), 1);
+    }
+
+    #[test]
+    fn sorted_set_zincrby() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"zs",
+                &[(b"a" as &[u8], 1.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        let new_score = store.zincrby(b"zs", b"a", 2.5, n).unwrap();
+        assert!((new_score - 3.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sorted_set_zpopmin_zpopmax() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"zs",
+                &[(b"a" as &[u8], 1.0), (b"b", 2.0), (b"c", 3.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        let min = store.zpopmin(b"zs", 1, n).unwrap();
+        assert_eq!(min[0].0, "a");
+        let max = store.zpopmax(b"zs", 1, n).unwrap();
+        assert_eq!(max[0].0, "c");
+        assert_eq!(store.zcard(b"zs", n).unwrap(), 1);
+    }
+
+    #[test]
+    fn flushdb_clears_all() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"a", b"1", None, n);
+        store.set(b"b", b"2", None, n);
+        assert_eq!(store.dbsize(n), 2);
+        store.flushdb();
+        assert_eq!(store.dbsize(n), 0);
+    }
+
+    #[test]
+    fn append_creates_or_extends() {
+        let store = Store::new();
+        let n = now();
+        assert_eq!(store.append(b"key", b"hello", n), 5);
+        assert_eq!(store.append(b"key", b" world", n), 11);
+        assert_eq!(store.get(b"key", n).unwrap(), &b"hello world"[..]);
+    }
+
+    #[test]
+    fn setnx_only_sets_if_not_exists() {
+        let store = Store::new();
+        let n = now();
+        assert!(store.set_nx(b"key", b"first", n));
+        assert!(!store.set_nx(b"key", b"second", n));
+        assert_eq!(store.get(b"key", n).unwrap(), &b"first"[..]);
+    }
+
+    #[test]
+    fn persist_removes_ttl() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"key", b"val", Some(Duration::from_secs(100)), n);
+        assert!(store.ttl(b"key", n) > 0);
+        store.persist(b"key", n);
+        assert_eq!(store.ttl(b"key", n), -1);
+    }
+
+    #[test]
+    fn wrongtype_error_on_type_mismatch() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"str_key", b"hello", None, n);
+        let result = store.lpush(b"str_key", &[b"val"], n);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("WRONGTYPE"));
+    }
+
+    #[test]
+    fn scan_returns_all_keys_with_cursor() {
+        let store = Store::new();
+        let n = now();
+        for i in 0..25 {
+            store.set(format!("key:{i}").as_bytes(), b"v", None, n);
+        }
+        let mut all_keys = Vec::new();
+        let mut cursor = 0usize;
+        loop {
+            let (next, keys) = store.scan(cursor, b"*", 10, n);
+            all_keys.extend(keys);
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+        assert_eq!(all_keys.len(), 25);
+    }
+
+    #[test]
+    fn scan_with_pattern_filters() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"user:1", b"a", None, n);
+        store.set(b"user:2", b"b", None, n);
+        store.set(b"post:1", b"c", None, n);
+        let keys = store.keys(b"user:*", n);
+        assert_eq!(keys.len(), 2);
+        assert!(keys.iter().all(|k| k.starts_with("user:")));
+    }
+
+    #[test]
+    fn scan_cursor_past_end_returns_zero() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"a", b"1", None, n);
+        let (next, keys) = store.scan(999, b"*", 10, n);
+        assert_eq!(next, 0);
+        assert!(keys.is_empty());
+    }
+
+    #[test]
+    fn getset_returns_old_value() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"key", b"old", None, n);
+        let old = store.get_set(b"key", b"new", n);
+        assert_eq!(old.unwrap(), &b"old"[..]);
+        assert_eq!(store.get(b"key", n).unwrap(), &b"new"[..]);
+    }
+
+    #[test]
+    fn getdel_returns_and_removes() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"key", b"val", None, n);
+        let val = store.getdel(b"key", n);
+        assert_eq!(val.unwrap(), &b"val"[..]);
+        assert!(store.get(b"key", n).is_none());
+    }
+
+    #[test]
+    fn getex_updates_ttl() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"key", b"val", None, n);
+        assert_eq!(store.ttl(b"key", n), -1);
+        store.getex(b"key", Some(Duration::from_secs(100)), false, n);
+        assert!(store.ttl(b"key", n) > 0);
+    }
+
+    #[test]
+    fn getex_persist_removes_ttl() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"key", b"val", Some(Duration::from_secs(100)), n);
+        assert!(store.ttl(b"key", n) > 0);
+        store.getex(b"key", None, true, n);
+        assert_eq!(store.ttl(b"key", n), -1);
+    }
+
+    #[test]
+    fn getrange_slices_string() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"key", b"Hello, World!", None, n);
+        assert_eq!(store.getrange(b"key", 0, 4, n), &b"Hello"[..]);
+        assert_eq!(store.getrange(b"key", -6, -1, n), &b"World!"[..]);
+    }
+
+    #[test]
+    fn setrange_pads_and_overwrites() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"key", b"Hello", None, n);
+        store.setrange(b"key", 6, b"World", n);
+        let val = store.get(b"key", n).unwrap();
+        assert_eq!(val.len(), 11);
+        assert_eq!(val[5], 0);
+    }
+
+    #[test]
+    fn strlen_returns_length() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"key", b"hello", None, n);
+        assert_eq!(store.strlen(b"key", n), 5);
+        assert_eq!(store.strlen(b"missing", n), 0);
+    }
+
+    #[test]
+    fn msetnx_all_or_nothing() {
+        let store = Store::new();
+        let n = now();
+        assert!(store.msetnx(&[(b"a" as &[u8], b"1" as &[u8]), (b"b", b"2")], n));
+        assert!(!store.msetnx(&[(b"b", b"3"), (b"c", b"4")], n));
+        assert!(store.get(b"c", n).is_none());
+    }
+
+    #[test]
+    fn expire_and_pexpire() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"key", b"val", None, n);
+        assert!(store.expire(b"key", 100, n));
+        assert!(store.ttl(b"key", n) > 0);
+        assert!(store.pexpire(b"key", 50000, n));
+        assert!(store.pttl(b"key", n) > 0);
+    }
+
+    #[test]
+    fn lrange_with_negative_indices() {
+        let store = Store::new();
+        let n = now();
+        store
+            .rpush(b"list", &[b"a", b"b", b"c", b"d", b"e"], n)
+            .unwrap();
+        let range = store.lrange(b"list", -3, -1, n).unwrap();
+        assert_eq!(range.len(), 3);
+        assert_eq!(range[0], &b"c"[..]);
+        assert_eq!(range[2], &b"e"[..]);
+    }
+
+    #[test]
+    fn lindex_positive_and_negative() {
+        let store = Store::new();
+        let n = now();
+        store.rpush(b"list", &[b"a", b"b", b"c"], n).unwrap();
+        assert_eq!(store.lindex(b"list", 0, n).unwrap(), &b"a"[..]);
+        assert_eq!(store.lindex(b"list", -1, n).unwrap(), &b"c"[..]);
+        assert!(store.lindex(b"list", 99, n).is_none());
+    }
+
+    #[test]
+    fn lset_updates_element() {
+        let store = Store::new();
+        let n = now();
+        store.rpush(b"list", &[b"a", b"b", b"c"], n).unwrap();
+        store.lset(b"list", 1, b"B", n).unwrap();
+        assert_eq!(store.lindex(b"list", 1, n).unwrap(), &b"B"[..]);
+    }
+
+    #[test]
+    fn lset_out_of_range() {
+        let store = Store::new();
+        let n = now();
+        store.rpush(b"list", &[b"a"], n).unwrap();
+        let result = store.lset(b"list", 5, b"x", n);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn linsert_before_and_after() {
+        let store = Store::new();
+        let n = now();
+        store.rpush(b"list", &[b"a", b"c"], n).unwrap();
+        store.linsert(b"list", true, b"c", b"b", n).unwrap();
+        let range = store.lrange(b"list", 0, -1, n).unwrap();
+        assert_eq!(range.len(), 3);
+        assert_eq!(range[1], &b"b"[..]);
+    }
+
+    #[test]
+    fn lrem_removes_matching() {
+        let store = Store::new();
+        let n = now();
+        store
+            .rpush(b"list", &[b"a", b"b", b"a", b"c", b"a"], n)
+            .unwrap();
+        assert_eq!(store.lrem(b"list", 2, b"a", n).unwrap(), 2);
+        assert_eq!(store.llen(b"list", n).unwrap(), 3);
+    }
+
+    #[test]
+    fn ltrim_keeps_range() {
+        let store = Store::new();
+        let n = now();
+        store
+            .rpush(b"list", &[b"a", b"b", b"c", b"d", b"e"], n)
+            .unwrap();
+        store.ltrim(b"list", 1, 3, n).unwrap();
+        let range = store.lrange(b"list", 0, -1, n).unwrap();
+        assert_eq!(range.len(), 3);
+        assert_eq!(range[0], &b"b"[..]);
+    }
+
+    #[test]
+    fn lpushx_rpushx_only_if_exists() {
+        let store = Store::new();
+        let n = now();
+        assert_eq!(store.lpushx(b"list", &[b"a"], n), 0);
+        store.rpush(b"list", &[b"x"], n).unwrap();
+        assert_eq!(store.lpushx(b"list", &[b"a"], n), 2);
+        assert_eq!(store.rpushx(b"list", &[b"z"], n), 3);
+    }
+
+    #[test]
+    fn lmove_between_lists() {
+        let store = Store::new();
+        let n = now();
+        store.rpush(b"src", &[b"a", b"b", b"c"], n).unwrap();
+        let val = store.lmove(b"src", b"dst", false, true, n);
+        assert_eq!(val.unwrap(), &b"c"[..]);
+        assert_eq!(store.llen(b"src", n).unwrap(), 2);
+        assert_eq!(store.llen(b"dst", n).unwrap(), 1);
+    }
+
+    #[test]
+    fn hsetnx_only_if_field_missing() {
+        let store = Store::new();
+        let n = now();
+        assert!(store.hsetnx(b"h", b"f", b"v1", n).unwrap());
+        assert!(!store.hsetnx(b"h", b"f", b"v2", n).unwrap());
+        assert_eq!(store.hget(b"h", b"f", n).unwrap(), &b"v1"[..]);
+    }
+
+    #[test]
+    fn hincrby_creates_and_increments() {
+        let store = Store::new();
+        let n = now();
+        store.hincrby(b"h", b"counter", 5, n).unwrap();
+        store.hincrby(b"h", b"counter", 3, n).unwrap();
+        let val = store.hget(b"h", b"counter", n).unwrap();
+        assert_eq!(val, &b"8"[..]);
+    }
+
+    #[test]
+    fn hgetall_returns_all_pairs() {
+        let store = Store::new();
+        let n = now();
+        store
+            .hset(b"h", &[(b"a" as &[u8], b"1" as &[u8]), (b"b", b"2")], n)
+            .unwrap();
+        let pairs = store.hgetall(b"h", n).unwrap();
+        assert_eq!(pairs.len(), 2);
+    }
+
+    #[test]
+    fn smove_between_sets() {
+        let store = Store::new();
+        let n = now();
+        store.sadd(b"s1", &[b"a", b"b"], n).unwrap();
+        store.sadd(b"s2", &[b"c"], n).unwrap();
+        assert!(store.smove(b"s1", b"s2", b"a", n).unwrap());
+        assert_eq!(store.scard(b"s1", n).unwrap(), 1);
+        assert_eq!(store.scard(b"s2", n).unwrap(), 2);
+    }
+
+    #[test]
+    fn sunion_sinter_sdiff() {
+        let store = Store::new();
+        let n = now();
+        store.sadd(b"s1", &[b"a", b"b", b"c"], n).unwrap();
+        store.sadd(b"s2", &[b"b", b"c", b"d"], n).unwrap();
+
+        let union = store.sunion(&[b"s1", b"s2"], n).unwrap();
+        assert_eq!(union.len(), 4);
+
+        let inter = store.sinter(&[b"s1", b"s2"], n).unwrap();
+        assert_eq!(inter.len(), 2);
+
+        let diff = store.sdiff(&[b"s1", b"s2"], n).unwrap();
+        assert_eq!(diff.len(), 1);
+        assert!(diff.contains(&"a".to_string()));
+    }
+
+    #[test]
+    fn sdiffstore_sinterstore_sunionstore() {
+        let store = Store::new();
+        let n = now();
+        store.sadd(b"s1", &[b"a", b"b"], n).unwrap();
+        store.sadd(b"s2", &[b"b", b"c"], n).unwrap();
+
+        assert_eq!(store.sunionstore(b"u", &[b"s1", b"s2"], n).unwrap(), 3);
+        assert_eq!(store.sinterstore(b"i", &[b"s1", b"s2"], n).unwrap(), 1);
+        assert_eq!(store.sdiffstore(b"d", &[b"s1", b"s2"], n).unwrap(), 1);
+    }
+
+    #[test]
+    fn smismember_checks_multiple() {
+        let store = Store::new();
+        let n = now();
+        store.sadd(b"s", &[b"a", b"b"], n).unwrap();
+        let results = store.smismember(b"s", &[b"a", b"c", b"b"], n);
+        assert_eq!(results, vec![true, false, true]);
+    }
+
+    #[test]
+    fn sorted_set_zadd_xx_only_updates_existing() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"zs",
+                &[(b"a" as &[u8], 1.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        let added = store
+            .zadd(
+                b"zs",
+                &[(b"a" as &[u8], 5.0), (b"b", 2.0)],
+                false,
+                true,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        assert_eq!(added, 0);
+        assert_eq!(store.zscore(b"zs", b"a", n).unwrap(), Some(5.0));
+        assert_eq!(store.zscore(b"zs", b"b", n).unwrap(), None);
+    }
+
+    #[test]
+    fn sorted_set_zadd_gt_lt() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"zs",
+                &[(b"a" as &[u8], 5.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        store
+            .zadd(
+                b"zs",
+                &[(b"a" as &[u8], 3.0)],
+                false,
+                false,
+                true,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        assert_eq!(store.zscore(b"zs", b"a", n).unwrap(), Some(5.0));
+        store
+            .zadd(
+                b"zs",
+                &[(b"a" as &[u8], 3.0)],
+                false,
+                false,
+                false,
+                true,
+                false,
+                n,
+            )
+            .unwrap();
+        assert_eq!(store.zscore(b"zs", b"a", n).unwrap(), Some(3.0));
+    }
+
+    #[test]
+    fn sorted_set_zrangebyscore() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"zs",
+                &[(b"a" as &[u8], 1.0), (b"b", 2.0), (b"c", 3.0), (b"d", 4.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        let items = store
+            .zrangebyscore(b"zs", 2.0, 3.0, false, false, false, None, None, true, n)
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].0, "b");
+        assert_eq!(items[1].0, "c");
+    }
+
+    #[test]
+    fn sorted_set_zrangebyscore_exclusive() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"zs",
+                &[(b"a" as &[u8], 1.0), (b"b", 2.0), (b"c", 3.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        let items = store
+            .zrangebyscore(b"zs", 1.0, 3.0, true, true, false, None, None, true, n)
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].0, "b");
+    }
+
+    #[test]
+    fn sorted_set_zcount() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"zs",
+                &[(b"a" as &[u8], 1.0), (b"b", 2.0), (b"c", 3.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        assert_eq!(store.zcount(b"zs", 1.0, 3.0, false, false, n).unwrap(), 3);
+        assert_eq!(store.zcount(b"zs", 1.0, 3.0, true, true, n).unwrap(), 1);
+    }
+
+    #[test]
+    fn sorted_set_zunionstore() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"z1",
+                &[(b"a" as &[u8], 1.0), (b"b", 2.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        store
+            .zadd(
+                b"z2",
+                &[(b"b" as &[u8], 3.0), (b"c", 4.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        let count = store
+            .zunionstore(b"out", &[b"z1", b"z2"], &[], "SUM", n)
+            .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(store.zscore(b"out", b"b", n).unwrap(), Some(5.0));
+    }
+
+    #[test]
+    fn sorted_set_zinterstore() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"z1",
+                &[(b"a" as &[u8], 1.0), (b"b", 2.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        store
+            .zadd(
+                b"z2",
+                &[(b"b" as &[u8], 3.0), (b"c", 4.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        let count = store
+            .zinterstore(b"out", &[b"z1", b"z2"], &[], "SUM", n)
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(store.zscore(b"out", b"b", n).unwrap(), Some(5.0));
+    }
+
+    #[test]
+    fn sorted_set_zdiffstore() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"z1",
+                &[(b"a" as &[u8], 1.0), (b"b", 2.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        store
+            .zadd(
+                b"z2",
+                &[(b"b" as &[u8], 3.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        let count = store.zdiffstore(b"out", &[b"z1", b"z2"], n).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(store.zscore(b"out", b"a", n).unwrap(), Some(1.0));
+    }
+
+    #[test]
+    fn sorted_set_zrangebylex() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"zs",
+                &[(b"a" as &[u8], 0.0), (b"b", 0.0), (b"c", 0.0), (b"d", 0.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        let items = store
+            .zrangebylex(b"zs", "[b", "[d", None, None, false, n)
+            .unwrap();
+        assert_eq!(items, vec!["b", "c", "d"]);
+        let items = store
+            .zrangebylex(b"zs", "(a", "(d", None, None, false, n)
+            .unwrap();
+        assert_eq!(items, vec!["b", "c"]);
+        let items = store
+            .zrangebylex(b"zs", "-", "+", None, None, false, n)
+            .unwrap();
+        assert_eq!(items.len(), 4);
+    }
+
+    #[test]
+    fn sorted_set_zmscore() {
+        let store = Store::new();
+        let n = now();
+        store
+            .zadd(
+                b"zs",
+                &[(b"a" as &[u8], 1.0), (b"b", 2.0)],
+                false,
+                false,
+                false,
+                false,
+                false,
+                n,
+            )
+            .unwrap();
+        let scores = store.zmscore(b"zs", &[b"a", b"missing", b"b"], n).unwrap();
+        assert_eq!(scores, vec![Some(1.0), None, Some(2.0)]);
+    }
+
+    #[test]
+    fn expire_sweep_cleans_expired() {
+        let store = Store::new();
+        let n = now();
+        store.set(b"keep", b"val", None, n);
+        store.set(b"expire_me", b"val", Some(Duration::from_millis(1)), n);
+        std::thread::sleep(Duration::from_millis(5));
+        let later = Instant::now();
+        for _ in 0..50 {
+            store.expire_sweep(later);
+        }
+        assert!(store.get(b"keep", later).is_some());
+        assert!(store.get(b"expire_me", later).is_none());
+    }
+
+    #[test]
+    fn glob_matcher_patterns() {
+        let m = GlobMatcher::new("user:*");
+        assert!(m.matches("user:123"));
+        assert!(m.matches("user:"));
+        assert!(!m.matches("post:1"));
+
+        let m2 = GlobMatcher::new("h?llo");
+        assert!(m2.matches("hello"));
+        assert!(m2.matches("hallo"));
+        assert!(!m2.matches("hllo"));
+
+        let m3 = GlobMatcher::new("*");
+        assert!(m3.matches("anything"));
+        assert!(m3.matches(""));
+    }
+}

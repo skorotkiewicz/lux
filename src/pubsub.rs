@@ -43,3 +43,59 @@ impl Broker {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn subscribe_and_publish() {
+        let broker = Broker::new();
+        let mut rx = broker.subscribe("test-channel").await;
+        let count = broker.publish("test-channel", "hello".to_string()).await;
+        assert_eq!(count, 1);
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.channel, "test-channel");
+        assert_eq!(msg.payload, "hello");
+    }
+
+    #[tokio::test]
+    async fn publish_to_empty_channel_returns_zero() {
+        let broker = Broker::new();
+        let count = broker
+            .publish("nobody-listening", "hello".to_string())
+            .await;
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn multiple_subscribers() {
+        let broker = Broker::new();
+        let mut rx1 = broker.subscribe("ch").await;
+        let mut rx2 = broker.subscribe("ch").await;
+        broker.publish("ch", "msg".to_string()).await;
+        assert_eq!(rx1.recv().await.unwrap().payload, "msg");
+        assert_eq!(rx2.recv().await.unwrap().payload, "msg");
+    }
+
+    #[tokio::test]
+    async fn separate_channels_are_isolated() {
+        let broker = Broker::new();
+        let mut rx_a = broker.subscribe("a").await;
+        let _rx_b = broker.subscribe("b").await;
+        broker.publish("a", "only-a".to_string()).await;
+        assert_eq!(rx_a.recv().await.unwrap().payload, "only-a");
+    }
+
+    #[tokio::test]
+    async fn multiple_messages_in_order() {
+        let broker = Broker::new();
+        let mut rx = broker.subscribe("ch").await;
+        broker.publish("ch", "first".to_string()).await;
+        broker.publish("ch", "second".to_string()).await;
+        broker.publish("ch", "third".to_string()).await;
+        assert_eq!(rx.recv().await.unwrap().payload, "first");
+        assert_eq!(rx.recv().await.unwrap().payload, "second");
+        assert_eq!(rx.recv().await.unwrap().payload, "third");
+    }
+}
