@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use hashbrown::HashMap;
 use parking_lot::RwLock;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::hash::{BuildHasher, Hasher};
 use std::time::{Duration, Instant};
 
@@ -49,6 +49,59 @@ pub enum StoreValue {
     List(VecDeque<Bytes>),
     Hash(HashMap<String, Bytes>),
     Set(HashSet<String>),
+    ZSet(ZSet),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Score(pub f64);
+
+impl Eq for Score {}
+
+impl PartialOrd for Score {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Score {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .partial_cmp(&other.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZMember {
+    pub score: Score,
+    pub member: String,
+}
+
+impl PartialOrd for ZMember {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ZMember {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score
+            .cmp(&other.score)
+            .then_with(|| self.member.cmp(&other.member))
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ZSet {
+    pub members: HashMap<String, f64>,
+    pub ordered: BTreeSet<ZMember>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RangeOptions {
+    pub with_scores: bool,
+    pub offset: Option<usize>,
+    pub count: Option<usize>,
 }
 
 impl StoreValue {
@@ -58,6 +111,7 @@ impl StoreValue {
             StoreValue::List(_) => "list",
             StoreValue::Hash(_) => "hash",
             StoreValue::Set(_) => "set",
+            StoreValue::ZSet(_) => "zset",
         }
     }
 }
@@ -975,6 +1029,617 @@ impl Store {
         }
         Ok(result.into_iter().collect())
     }
+    pub fn zadd(&self, key: &[u8], members: &[(f64, String)], now: Instant) -> Result<i64, String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        let ks = key_string(key);
+        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
+            value: StoreValue::ZSet(ZSet::default()),
+            expires_at: None,
+        });
+        if entry.is_expired_at(now) {
+            entry.value = StoreValue::ZSet(ZSet::default());
+            entry.expires_at = None;
+        }
+        match &mut entry.value {
+            StoreValue::ZSet(zset) => {
+                let mut added = 0i64;
+                for (score, member) in members {
+                    if let Some(old_score) = zset.members.get(member) {
+                        if (old_score - score).abs() > f64::EPSILON {
+                            zset.ordered.remove(&ZMember {
+                                score: Score(*old_score),
+                                member: member.clone(),
+                            });
+                            zset.ordered.insert(ZMember {
+                                score: Score(*score),
+                                member: member.clone(),
+                            });
+                            zset.members.insert(member.clone(), *score);
+                        }
+                    } else {
+                        zset.members.insert(member.clone(), *score);
+                        zset.ordered.insert(ZMember {
+                            score: Score(*score),
+                            member: member.clone(),
+                        });
+                        added += 1;
+                    }
+                }
+                Ok(added)
+            }
+            _ => {
+                Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+            }
+        }
+    }
+
+    pub fn zrange(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+        with_scores: bool,
+        now: Instant,
+    ) -> Result<Vec<String>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::ZSet(zset) => {
+                    let len = zset.ordered.len() as i64;
+                    let s = if start < 0 {
+                        (len + start).max(0) as usize
+                    } else {
+                        start.min(len) as usize
+                    };
+                    let e = if stop < 0 {
+                        (len + stop + 1).max(0) as usize
+                    } else {
+                        (stop + 1).min(len) as usize
+                    };
+                    if s >= e {
+                        return Ok(vec![]);
+                    }
+                    let mut res = Vec::new();
+                    for m in zset.ordered.iter().skip(s).take(e - s) {
+                        res.push(m.member.clone());
+                        if with_scores {
+                            res.push(m.score.0.to_string());
+                        }
+                    }
+                    Ok(res)
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(vec![]),
+        }
+    }
+
+    pub fn zrevrange(
+        &self,
+        key: &[u8],
+        start: i64,
+        stop: i64,
+        with_scores: bool,
+        now: Instant,
+    ) -> Result<Vec<String>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::ZSet(zset) => {
+                    let len = zset.ordered.len() as i64;
+                    let s = if start < 0 {
+                        (len + start).max(0) as usize
+                    } else {
+                        start.min(len) as usize
+                    };
+                    let e = if stop < 0 {
+                        (len + stop + 1).max(0) as usize
+                    } else {
+                        (stop + 1).min(len) as usize
+                    };
+                    if s >= e {
+                        return Ok(vec![]);
+                    }
+                    let mut res = Vec::new();
+                    for m in zset.ordered.iter().rev().skip(s).take(e - s) {
+                        res.push(m.member.clone());
+                        if with_scores {
+                            res.push(m.score.0.to_string());
+                        }
+                    }
+                    Ok(res)
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(vec![]),
+        }
+    }
+
+    pub fn zscore(&self, key: &[u8], member: &[u8], now: Instant) -> Result<Option<f64>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::ZSet(zset) => Ok(zset.members.get(key_str(member)).copied()),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    pub fn zrem(&self, key: &[u8], members: &[&[u8]], now: Instant) -> Result<i64, String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        match shard.data.get_mut(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &mut entry.value {
+                StoreValue::ZSet(zset) => {
+                    let mut removed = 0i64;
+                    for m in members {
+                        let ms = key_str(m);
+                        if let Some(score) = zset.members.remove(ms) {
+                            zset.ordered.remove(&ZMember {
+                                score: Score(score),
+                                member: ms.to_string(),
+                            });
+                            removed += 1;
+                        }
+                    }
+                    Ok(removed)
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(0),
+        }
+    }
+
+    pub fn zcard(&self, key: &[u8], now: Instant) -> Result<i64, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::ZSet(zset) => Ok(zset.members.len() as i64),
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(0),
+        }
+    }
+
+    pub fn zrank(&self, key: &[u8], member: &[u8], now: Instant) -> Result<Option<usize>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::ZSet(zset) => {
+                    let ms = key_str(member);
+                    if let Some(score) = zset.members.get(ms) {
+                        let rank = zset
+                            .ordered
+                            .range(
+                                ..ZMember {
+                                    score: Score(*score),
+                                    member: ms.to_string(),
+                                },
+                            )
+                            .count();
+                        Ok(Some(rank))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    pub fn zrevrank(
+        &self,
+        key: &[u8],
+        member: &[u8],
+        now: Instant,
+    ) -> Result<Option<usize>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::ZSet(zset) => {
+                    let ms = key_str(member);
+                    if let Some(score) = zset.members.get(ms) {
+                        let rank = zset
+                            .ordered
+                            .range(
+                                ZMember {
+                                    score: Score(*score),
+                                    member: ms.to_string(),
+                                }..,
+                            )
+                            .count()
+                            - 1;
+                        Ok(Some(rank))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    pub fn zincrby(
+        &self,
+        key: &[u8],
+        increment: f64,
+        member: &[u8],
+        now: Instant,
+    ) -> Result<f64, String> {
+        let idx = self.shard_index(key);
+        let mut shard = self.shards[idx].write();
+        let ks = key_string(key);
+        let entry = shard.data.entry(ks).or_insert_with(|| Entry {
+            value: StoreValue::ZSet(ZSet::default()),
+            expires_at: None,
+        });
+        if entry.is_expired_at(now) {
+            entry.value = StoreValue::ZSet(ZSet::default());
+            entry.expires_at = None;
+        }
+        match &mut entry.value {
+            StoreValue::ZSet(zset) => {
+                let ms = key_string(member);
+                let current = zset.members.get(&ms).copied().unwrap_or(0.0);
+                let new_score = current + increment;
+                if let Some(old_score) = zset.members.insert(ms.clone(), new_score) {
+                    zset.ordered.remove(&ZMember {
+                        score: Score(old_score),
+                        member: ms.clone(),
+                    });
+                }
+                zset.ordered.insert(ZMember {
+                    score: Score(new_score),
+                    member: ms,
+                });
+                Ok(new_score)
+            }
+            _ => {
+                Err("WRONGTYPE Operation against a key holding the wrong kind of value".to_string())
+            }
+        }
+    }
+
+    pub fn zcount(&self, key: &[u8], min: f64, max: f64, now: Instant) -> Result<i64, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::ZSet(zset) => {
+                    let count = zset
+                        .ordered
+                        .iter()
+                        .filter(|m| m.score.0 >= min && m.score.0 <= max)
+                        .count();
+                    Ok(count as i64)
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(0),
+        }
+    }
+
+    pub fn zrangebyscore(
+        &self,
+        key: &[u8],
+        min: f64,
+        max: f64,
+        opts: RangeOptions,
+        now: Instant,
+    ) -> Result<Vec<String>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::ZSet(zset) => {
+                    let mut res = Vec::new();
+                    let iter = zset
+                        .ordered
+                        .iter()
+                        .filter(|m| m.score.0 >= min && m.score.0 <= max);
+                    let skip = opts.offset.unwrap_or(0);
+                    let take = opts.count.unwrap_or(usize::MAX);
+                    for m in iter.skip(skip).take(take) {
+                        res.push(m.member.clone());
+                        if opts.with_scores {
+                            res.push(m.score.0.to_string());
+                        }
+                    }
+                    Ok(res)
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(vec![]),
+        }
+    }
+
+    pub fn zrevrangebyscore(
+        &self,
+        key: &[u8],
+        max: f64,
+        min: f64,
+        opts: RangeOptions,
+        now: Instant,
+    ) -> Result<Vec<String>, String> {
+        let idx = self.shard_index(key);
+        let shard = self.shards[idx].read();
+        match shard.data.get(key_str(key)) {
+            Some(entry) if !entry.is_expired_at(now) => match &entry.value {
+                StoreValue::ZSet(zset) => {
+                    let mut res = Vec::new();
+                    let iter = zset
+                        .ordered
+                        .iter()
+                        .rev()
+                        .filter(|m| m.score.0 >= min && m.score.0 <= max);
+                    let skip = opts.offset.unwrap_or(0);
+                    let take = opts.count.unwrap_or(usize::MAX);
+                    for m in iter.skip(skip).take(take) {
+                        res.push(m.member.clone());
+                        if opts.with_scores {
+                            res.push(m.score.0.to_string());
+                        }
+                    }
+                    Ok(res)
+                }
+                _ => Err(
+                    "WRONGTYPE Operation against a key holding the wrong kind of value".to_string(),
+                ),
+            },
+            _ => Ok(vec![]),
+        }
+    }
+
+    pub fn zunionstore(
+        &self,
+        destination: &[u8],
+        keys: &[&[u8]],
+        weights: Option<Vec<f64>>,
+        aggregate: &str,
+        now: Instant,
+    ) -> Result<i64, String> {
+        let mut result_map: HashMap<String, f64> = HashMap::new();
+        for (i, key) in keys.iter().enumerate() {
+            let weight = weights.as_ref().map(|w| w[i]).unwrap_or(1.0);
+            let idx = self.shard_index(key);
+            let shard = self.shards[idx].read();
+            if let Some(entry) = shard.data.get(key_str(key)) {
+                if !entry.is_expired_at(now) {
+                    match &entry.value {
+                        StoreValue::ZSet(zset) => {
+                            for (member, score) in &zset.members {
+                                let w_score = score * weight;
+                                match aggregate {
+                                    "SUM" | "" => {
+                                        *result_map.entry(member.clone()).or_insert(0.0) += w_score;
+                                    }
+                                    "MIN" => {
+                                        let e = result_map
+                                            .entry(member.clone())
+                                            .or_insert(f64::INFINITY);
+                                        *e = e.min(w_score);
+                                    }
+                                    "MAX" => {
+                                        let e = result_map
+                                            .entry(member.clone())
+                                            .or_insert(f64::NEG_INFINITY);
+                                        *e = e.max(w_score);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        StoreValue::Set(set) => {
+                            for member in set {
+                                let w_score = 1.0 * weight;
+                                match aggregate {
+                                    "SUM" | "" => {
+                                        *result_map.entry(member.clone()).or_insert(0.0) += w_score;
+                                    }
+                                    "MIN" => {
+                                        let e = result_map
+                                            .entry(member.clone())
+                                            .or_insert(f64::INFINITY);
+                                        *e = e.min(w_score);
+                                    }
+                                    "MAX" => {
+                                        let e = result_map
+                                            .entry(member.clone())
+                                            .or_insert(f64::NEG_INFINITY);
+                                        *e = e.max(w_score);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut ordered = BTreeSet::new();
+        for (member, score) in &result_map {
+            ordered.insert(ZMember {
+                score: Score(*score),
+                member: member.clone(),
+            });
+        }
+
+        let added = result_map.len() as i64;
+        let dest_idx = self.shard_index(destination);
+        let mut shard = self.shards[dest_idx].write();
+        shard.data.insert(
+            key_string(destination),
+            Entry {
+                value: StoreValue::ZSet(ZSet {
+                    members: result_map,
+                    ordered,
+                }),
+                expires_at: None,
+            },
+        );
+        Ok(added)
+    }
+
+    pub fn zinterstore(
+        &self,
+        destination: &[u8],
+        keys: &[&[u8]],
+        weights: Option<Vec<f64>>,
+        aggregate: &str,
+        now: Instant,
+    ) -> Result<i64, String> {
+        if keys.is_empty() {
+            self.del(&[destination]);
+            return Ok(0);
+        }
+
+        let mut result_map: HashMap<String, f64> = HashMap::new();
+
+        // Initialize with first set
+        {
+            let key = keys[0];
+            let weight = weights.as_ref().map(|w| w[0]).unwrap_or(1.0);
+            let idx = self.shard_index(key);
+            let shard = self.shards[idx].read();
+            if let Some(entry) = shard.data.get(key_str(key)) {
+                if !entry.is_expired_at(now) {
+                    match &entry.value {
+                        StoreValue::ZSet(zset) => {
+                            for (member, score) in &zset.members {
+                                result_map.insert(member.clone(), score * weight);
+                            }
+                        }
+                        StoreValue::Set(set) => {
+                            for member in set {
+                                result_map.insert(member.clone(), 1.0 * weight);
+                            }
+                        }
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        if result_map.is_empty() {
+            self.del(&[destination]);
+            return Ok(0);
+        }
+
+        for (i, key) in keys.iter().enumerate().skip(1) {
+            let weight = weights.as_ref().map(|w| w[i]).unwrap_or(1.0);
+            let idx = self.shard_index(key);
+            let shard = self.shards[idx].read();
+
+            let mut next_map = HashMap::new();
+            if let Some(entry) = shard.data.get(key_str(key)) {
+                if !entry.is_expired_at(now) {
+                    match &entry.value {
+                        StoreValue::ZSet(zset) => {
+                            for (member, score) in &zset.members {
+                                if let Some(old_score) = result_map.get(member) {
+                                    let w_score = score * weight;
+                                    let new_score = match aggregate {
+                                        "SUM" | "" => old_score + w_score,
+                                        "MIN" => old_score.min(w_score),
+                                        "MAX" => old_score.max(w_score),
+                                        _ => *old_score,
+                                    };
+                                    next_map.insert(member.clone(), new_score);
+                                }
+                            }
+                        }
+                        StoreValue::Set(set) => {
+                            for member in set {
+                                if let Some(old_score) = result_map.get(member) {
+                                    let w_score = 1.0 * weight;
+                                    let new_score = match aggregate {
+                                        "SUM" | "" => old_score + w_score,
+                                        "MIN" => old_score.min(w_score),
+                                        "MAX" => old_score.max(w_score),
+                                        _ => *old_score,
+                                    };
+                                    next_map.insert(member.clone(), new_score);
+                                }
+                            }
+                        }
+                        _ => {
+                            return Err(
+                                "WRONGTYPE Operation against a key holding the wrong kind of value"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                }
+            }
+            result_map = next_map;
+            if result_map.is_empty() {
+                break;
+            }
+        }
+
+        let mut ordered = BTreeSet::new();
+        for (member, score) in &result_map {
+            ordered.insert(ZMember {
+                score: Score(*score),
+                member: member.clone(),
+            });
+        }
+
+        let added = result_map.len() as i64;
+        let dest_idx = self.shard_index(destination);
+        let mut shard = self.shards[dest_idx].write();
+        shard.data.insert(
+            key_string(destination),
+            Entry {
+                value: StoreValue::ZSet(ZSet {
+                    members: result_map,
+                    ordered,
+                }),
+                expires_at: None,
+            },
+        );
+        Ok(added)
+    }
 
     pub fn approximate_memory(&self) -> usize {
         let now = Instant::now();
@@ -991,6 +1656,7 @@ impl Store {
                     StoreValue::List(l) => l.iter().map(|b| b.len() + 32).sum(),
                     StoreValue::Hash(h) => h.iter().map(|(k, v)| k.len() + v.len() + 64).sum(),
                     StoreValue::Set(s) => s.iter().map(|m| m.len() + 32).sum(),
+                    StoreValue::ZSet(z) => z.members.iter().map(|(m, _)| m.len() + 64).sum(),
                 };
             }
         }
@@ -1026,6 +1692,9 @@ impl Store {
                                 .collect(),
                         ),
                         StoreValue::Set(s) => DumpValue::Set(s.iter().cloned().collect()),
+                        StoreValue::ZSet(z) => DumpValue::ZSet(
+                            z.members.iter().map(|(m, s)| (m.clone(), *s)).collect(),
+                        ),
                     },
                     ttl_ms,
                 });
@@ -1044,6 +1713,18 @@ impl Store {
                 StoreValue::Hash(h.into_iter().map(|(k, v)| (k, Bytes::from(v))).collect())
             }
             DumpValue::Set(s) => StoreValue::Set(s.into_iter().collect()),
+            DumpValue::ZSet(z) => {
+                let mut members = HashMap::new();
+                let mut ordered = BTreeSet::new();
+                for (member, score) in z {
+                    members.insert(member.clone(), score);
+                    ordered.insert(ZMember {
+                        score: Score(score),
+                        member,
+                    });
+                }
+                StoreValue::ZSet(ZSet { members, ordered })
+            }
         };
         let expires_at = ttl.map(|d| Instant::now() + d);
         shard.data.insert(
@@ -1718,6 +2399,7 @@ pub enum DumpValue {
     List(Vec<String>),
     Hash(Vec<(String, String)>),
     Set(Vec<String>),
+    ZSet(Vec<(String, f64)>),
 }
 
 pub struct DumpEntry {

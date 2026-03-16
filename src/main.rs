@@ -96,6 +96,8 @@ async fn handle_connection(
     let mut write_buf = BytesMut::with_capacity(65536);
     let mut pending = BytesMut::new();
     let mut subscriptions: HashMap<String, broadcast::Receiver<pubsub::Message>> = HashMap::new();
+    let mut pattern_subscriptions: HashMap<String, broadcast::Receiver<pubsub::Message>> =
+        HashMap::new();
     let mut sub_mode = false;
     let mut authenticated = !require_auth;
 
@@ -123,7 +125,19 @@ async fn handle_connection(
                                 resp::write_array_header(&mut write_buf, 3);
                                 resp::write_bulk(&mut write_buf, "subscribe");
                                 resp::write_bulk(&mut write_buf, &ch);
-                                resp::write_integer(&mut write_buf, subscriptions.len() as i64);
+                                resp::write_integer(&mut write_buf, (subscriptions.len() + pattern_subscriptions.len()) as i64);
+                            }
+                        } else if cmd_eq_fast(args[0], b"PSUBSCRIBE") {
+                            for pat_bytes in &args[1..] {
+                                let pat = std::str::from_utf8(pat_bytes).unwrap_or("").to_string();
+                                if !pattern_subscriptions.contains_key(&pat) {
+                                    let rx = broker.psubscribe(&pat).await;
+                                    pattern_subscriptions.insert(pat.clone(), rx);
+                                }
+                                resp::write_array_header(&mut write_buf, 3);
+                                resp::write_bulk(&mut write_buf, "psubscribe");
+                                resp::write_bulk(&mut write_buf, &pat);
+                                resp::write_integer(&mut write_buf, (subscriptions.len() + pattern_subscriptions.len()) as i64);
                             }
                         } else if cmd_eq_fast(args[0], b"UNSUBSCRIBE") {
                             let channels: Vec<String> = if args.len() > 1 {
@@ -136,9 +150,25 @@ async fn handle_connection(
                                 resp::write_array_header(&mut write_buf, 3);
                                 resp::write_bulk(&mut write_buf, "unsubscribe");
                                 resp::write_bulk(&mut write_buf, ch);
-                                resp::write_integer(&mut write_buf, subscriptions.len() as i64);
+                                resp::write_integer(&mut write_buf, (subscriptions.len() + pattern_subscriptions.len()) as i64);
                             }
-                            if subscriptions.is_empty() {
+                            if subscriptions.is_empty() && pattern_subscriptions.is_empty() {
+                                sub_mode = false;
+                            }
+                        } else if cmd_eq_fast(args[0], b"PUNSUBSCRIBE") {
+                            let patterns: Vec<String> = if args.len() > 1 {
+                                args[1..].iter().map(|a| std::str::from_utf8(a).unwrap_or("").to_string()).collect()
+                            } else {
+                                pattern_subscriptions.keys().cloned().collect()
+                            };
+                            for pat in &patterns {
+                                pattern_subscriptions.remove(pat);
+                                resp::write_array_header(&mut write_buf, 3);
+                                resp::write_bulk(&mut write_buf, "punsubscribe");
+                                resp::write_bulk(&mut write_buf, pat);
+                                resp::write_integer(&mut write_buf, (subscriptions.len() + pattern_subscriptions.len()) as i64);
+                            }
+                            if subscriptions.is_empty() && pattern_subscriptions.is_empty() {
                                 sub_mode = false;
                             }
                         } else if cmd_eq_fast(args[0], b"PING") {
@@ -148,7 +178,7 @@ async fn handle_connection(
                                 resp::write_pong(&mut write_buf);
                             }
                         } else {
-                            resp::write_error(&mut write_buf, "ERR only SUBSCRIBE, UNSUBSCRIBE, and PING are allowed in subscribe mode");
+                            resp::write_error(&mut write_buf, "ERR only SUBSCRIBE, PSUBSCRIBE, UNSUBSCRIBE, PUNSUBSCRIBE and PING are allowed in subscribe mode");
                         }
                         let _ = now;
                     }
@@ -165,8 +195,18 @@ async fn handle_connection(
                             return Some(msg);
                         }
                     }
+                    for (_pat, rx) in pattern_subscriptions.iter_mut() {
+                        if let Ok(msg) = rx.try_recv() {
+                            return Some(msg);
+                        }
+                    }
                     tokio::time::sleep(std::time::Duration::from_millis(1)).await;
                     for (_ch, rx) in subscriptions.iter_mut() {
+                        if let Ok(msg) = rx.try_recv() {
+                            return Some(msg);
+                        }
+                    }
+                    for (_pat, rx) in pattern_subscriptions.iter_mut() {
                         if let Ok(msg) = rx.try_recv() {
                             return Some(msg);
                         }
@@ -174,10 +214,18 @@ async fn handle_connection(
                     None
                 } => {
                     if let Some(msg) = msg {
-                        resp::write_array_header(&mut write_buf, 3);
-                        resp::write_bulk(&mut write_buf, "message");
-                        resp::write_bulk(&mut write_buf, &msg.channel);
-                        resp::write_bulk(&mut write_buf, &msg.payload);
+                        if let Some(pattern) = msg.pattern {
+                            resp::write_array_header(&mut write_buf, 4);
+                            resp::write_bulk(&mut write_buf, "pmessage");
+                            resp::write_bulk(&mut write_buf, &pattern);
+                            resp::write_bulk(&mut write_buf, &msg.channel);
+                            resp::write_bulk(&mut write_buf, &msg.payload);
+                        } else {
+                            resp::write_array_header(&mut write_buf, 3);
+                            resp::write_bulk(&mut write_buf, "message");
+                            resp::write_bulk(&mut write_buf, &msg.channel);
+                            resp::write_bulk(&mut write_buf, &msg.payload);
+                        }
                         socket.write_all(&write_buf).await?;
                         write_buf.clear();
                     }
@@ -219,14 +267,36 @@ async fn handle_connection(
                         CmdResult::Authenticated => {
                             authenticated = true;
                         }
-                        CmdResult::Subscribe { channels } => {
+                        CmdResult::Subscribe {
+                            channels,
+                            is_pattern,
+                        } => {
                             for ch in &channels {
-                                let rx = broker.subscribe(ch).await;
-                                subscriptions.insert(ch.clone(), rx);
-                                resp::write_array_header(&mut write_buf, 3);
-                                resp::write_bulk(&mut write_buf, "subscribe");
-                                resp::write_bulk(&mut write_buf, ch);
-                                resp::write_integer(&mut write_buf, subscriptions.len() as i64);
+                                if is_pattern {
+                                    if !pattern_subscriptions.contains_key(ch) {
+                                        let rx = broker.psubscribe(ch).await;
+                                        pattern_subscriptions.insert(ch.clone(), rx);
+                                    }
+                                    resp::write_array_header(&mut write_buf, 3);
+                                    resp::write_bulk(&mut write_buf, "psubscribe");
+                                    resp::write_bulk(&mut write_buf, ch);
+                                    resp::write_integer(
+                                        &mut write_buf,
+                                        (subscriptions.len() + pattern_subscriptions.len()) as i64,
+                                    );
+                                } else {
+                                    if !subscriptions.contains_key(ch) {
+                                        let rx = broker.subscribe(ch).await;
+                                        subscriptions.insert(ch.clone(), rx);
+                                    }
+                                    resp::write_array_header(&mut write_buf, 3);
+                                    resp::write_bulk(&mut write_buf, "subscribe");
+                                    resp::write_bulk(&mut write_buf, ch);
+                                    resp::write_integer(
+                                        &mut write_buf,
+                                        (subscriptions.len() + pattern_subscriptions.len()) as i64,
+                                    );
+                                }
                             }
                             sub_mode = true;
                             break;
@@ -295,14 +365,38 @@ async fn handle_connection(
                             CmdResult::Authenticated => {
                                 authenticated = true;
                             }
-                            CmdResult::Subscribe { channels } => {
+                            CmdResult::Subscribe {
+                                channels,
+                                is_pattern,
+                            } => {
                                 for ch in &channels {
-                                    let rx = broker.subscribe(ch).await;
-                                    subscriptions.insert(ch.clone(), rx);
-                                    resp::write_array_header(&mut write_buf, 3);
-                                    resp::write_bulk(&mut write_buf, "subscribe");
-                                    resp::write_bulk(&mut write_buf, ch);
-                                    resp::write_integer(&mut write_buf, subscriptions.len() as i64);
+                                    if is_pattern {
+                                        if !pattern_subscriptions.contains_key(ch) {
+                                            let rx = broker.psubscribe(ch).await;
+                                            pattern_subscriptions.insert(ch.clone(), rx);
+                                        }
+                                        resp::write_array_header(&mut write_buf, 3);
+                                        resp::write_bulk(&mut write_buf, "psubscribe");
+                                        resp::write_bulk(&mut write_buf, ch);
+                                        resp::write_integer(
+                                            &mut write_buf,
+                                            (subscriptions.len() + pattern_subscriptions.len())
+                                                as i64,
+                                        );
+                                    } else {
+                                        if !subscriptions.contains_key(ch) {
+                                            let rx = broker.subscribe(ch).await;
+                                            subscriptions.insert(ch.clone(), rx);
+                                        }
+                                        resp::write_array_header(&mut write_buf, 3);
+                                        resp::write_bulk(&mut write_buf, "subscribe");
+                                        resp::write_bulk(&mut write_buf, ch);
+                                        resp::write_integer(
+                                            &mut write_buf,
+                                            (subscriptions.len() + pattern_subscriptions.len())
+                                                as i64,
+                                        );
+                                    }
                                 }
                                 sub_mode = true;
                                 break;

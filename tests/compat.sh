@@ -94,6 +94,51 @@ redis-cli -p $PORT HSET hincr count 10 > /dev/null
 redis-cli -p $PORT HINCRBY hincr count 5 > /dev/null
 run "HINCRBY" "15" "$(redis-cli -p $PORT HGET hincr count)"
 
+# Sorted Sets
+redis-cli -p $PORT ZADD myzset 1 "one" 2 "two" 3 "three" > /dev/null
+run "ZCARD" "3" "$(redis-cli -p $PORT ZCARD myzset)"
+run "ZSCORE" "2" "$(redis-cli -p $PORT ZSCORE myzset "two")"
+run "ZRANGE" "one
+two" "$(redis-cli -p $PORT ZRANGE myzset 0 1)"
+run "ZREVRANGE" "three
+two" "$(redis-cli -p $PORT ZREVRANGE myzset 0 1)"
+run "ZRANK" "1" "$(redis-cli -p $PORT ZRANK myzset "two")"
+run "ZREVRANK" "1" "$(redis-cli -p $PORT ZREVRANK myzset "two")"
+redis-cli -p $PORT ZINCRBY myzset 5 "one" > /dev/null
+run "ZSCORE after ZINCRBY" "6" "$(redis-cli -p $PORT ZSCORE myzset "one")"
+run "ZCOUNT" "3" "$(redis-cli -p $PORT ZCOUNT myzset 2 10)"
+run "ZRANGEBYSCORE" "two
+three" "$(redis-cli -p $PORT ZRANGEBYSCORE myzset 2 5)"
+redis-cli -p $PORT ZREM myzset "two" > /dev/null
+run "ZCARD after ZREM" "2" "$(redis-cli -p $PORT ZCARD myzset)"
+run "TYPE zset" "zset" "$(redis-cli -p $PORT TYPE myzset)"
+
+# ZUNIONSTORE/ZINTERSTORE
+redis-cli -p $PORT ZADD z1 1 a 2 b > /dev/null
+redis-cli -p $PORT ZADD z2 3 b 4 c > /dev/null
+redis-cli -p $PORT ZUNIONSTORE z3 2 z1 z2 > /dev/null
+run "ZUNIONSTORE ZCARD" "3" "$(redis-cli -p $PORT ZCARD z3)"
+run "ZUNIONSTORE ZSCORE" "5" "$(redis-cli -p $PORT ZSCORE z3 b)"
+redis-cli -p $PORT ZINTERSTORE z4 2 z1 z2 > /dev/null
+run "ZINTERSTORE ZCARD" "1" "$(redis-cli -p $PORT ZCARD z4)"
+run "ZINTERSTORE ZSCORE" "5" "$(redis-cli -p $PORT ZSCORE z4 b)"
+
+# OBJECT ENCODING
+run "OBJECT ENCODING string" "embstr" "$(redis-cli -p $PORT OBJECT ENCODING k1)"
+run "OBJECT ENCODING zset" "listpack" "$(redis-cli -p $PORT OBJECT ENCODING myzset)"
+
+# Pub/Sub (basic + pattern)
+run "PUBLISH no subscribers" "0" "$(redis-cli -p $PORT PUBLISH random_chan msg)"
+
+# Multi-subscriber test
+(redis-cli -p $PORT SUBSCRIBE chan1 > /dev/null) &
+PID1=$!
+(redis-cli -p $PORT PSUBSCRIBE "chan*" > /dev/null) &
+PID2=$!
+sleep 0.2
+run "PUBLISH with subscribers" "2" "$(redis-cli -p $PORT PUBLISH chan1 "hello")"
+kill $PID1 $PID2 2>/dev/null || true
+
 run "PING" "PONG" "$(redis-cli -p $PORT PING)"
 
 size=$(redis-cli -p $PORT DBSIZE)

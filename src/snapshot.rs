@@ -30,6 +30,7 @@ pub fn save(store: &Store) -> io::Result<usize> {
             DumpValue::List(_) => 'L',
             DumpValue::Hash(_) => 'H',
             DumpValue::Set(_) => 'T',
+            DumpValue::ZSet(_) => 'Z',
         };
         let encoded_value = match &entry.value {
             DumpValue::Str(s) => s.clone(),
@@ -40,6 +41,11 @@ pub fn save(store: &Store) -> io::Result<usize> {
                 .collect::<Vec<_>>()
                 .join("\x1f"),
             DumpValue::Set(members) => members.join("\x1f"),
+            DumpValue::ZSet(members) => members
+                .iter()
+                .map(|(m, s)| format!("{}\x1e{}", m, s))
+                .collect::<Vec<_>>()
+                .join("\x1f"),
         };
         writeln!(
             file,
@@ -68,7 +74,7 @@ pub fn load(store: &Store) -> io::Result<usize> {
         }
 
         if !line.contains('\t')
-            || line.chars().next().is_none_or(|c| !"SLHT".contains(c))
+            || line.chars().next().is_none_or(|c| !"SLHTZ".contains(c))
             || line.chars().nth(1) != Some('\t')
         {
             let parts: Vec<&str> = line.splitn(3, '\t').collect();
@@ -136,6 +142,24 @@ pub fn load(store: &Store) -> io::Result<usize> {
                     raw_value.split('\x1f').map(|s| s.to_string()).collect()
                 };
                 DumpValue::Set(members)
+            }
+            "Z" => {
+                let members: Vec<(String, f64)> = if raw_value.is_empty() {
+                    vec![]
+                } else {
+                    raw_value
+                        .split('\x1f')
+                        .filter_map(|pair| {
+                            let kv: Vec<&str> = pair.splitn(2, '\x1e').collect();
+                            if kv.len() == 2 {
+                                kv[1].parse::<f64>().ok().map(|s| (kv[0].to_string(), s))
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                };
+                DumpValue::ZSet(members)
             }
             _ => continue,
         };

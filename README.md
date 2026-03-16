@@ -48,14 +48,14 @@ Don't want to manage infrastructure? **[Lux Cloud](https://luxdb.dev)** is manag
 
 ## Features
 
-- **80+ Redis commands** -- strings, lists, hashes, sets, pub/sub
+- **90+ Redis commands** -- strings, lists, hashes, sets, sorted sets, pub/sub
 - **RESP protocol** -- drop-in compatible with every Redis client
 - **Multi-threaded** -- auto-tuned shards, parking_lot RwLocks, tokio async runtime
 - **Zero-copy parser** -- RESP arguments are byte slices into the read buffer
 - **Pipeline batching** -- commands grouped by shard, one lock acquisition per batch
 - **Persistence** -- automatic snapshots, configurable interval
 - **Auth** -- password authentication via `LUX_PASSWORD`
-- **Pub/Sub** -- SUBSCRIBE, UNSUBSCRIBE, PUBLISH
+- **Pub/Sub** -- SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH
 - **TTL support** -- EX, PX, EXPIRE, PEXPIRE, PERSIST, TTL, PTTL
 - **856KB Docker image** -- the entire database fits in under 1MB. Redis is 30MB. Dragonfly is 180MB.
 - **MIT licensed** -- no license rug-pulls, unlike Redis (RSALv2/SSPL)
@@ -152,9 +152,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 
 **Sets:** `SADD` `SREM` `SMEMBERS` `SISMEMBER` `SCARD` `SUNION` `SINTER` `SDIFF`
 
-**Pub/Sub:** `PUBLISH` `SUBSCRIBE` `UNSUBSCRIBE`
+**Sorted Sets:** `ZADD` `ZRANGE` `ZREVRANGE` `ZSCORE` `ZREM` `ZCARD` `ZRANK` `ZREVRANK` `ZINCRBY` `ZCOUNT` `ZRANGEBYSCORE` `ZREVRANGEBYSCORE` `ZUNIONSTORE` `ZINTERSTORE`
 
-**Server:** `PING` `ECHO` `INFO` `SAVE` `BGSAVE` `LASTSAVE` `AUTH` `CONFIG` `CLIENT` `SELECT` `COMMAND` `DUMP` `RESTORE`
+**Pub/Sub:** `PUBLISH` `SUBSCRIBE` `UNSUBSCRIBE` `PSUBSCRIBE` `PUNSUBSCRIBE`
+
+**Server:** `PING` `ECHO` `INFO` `SAVE` `BGSAVE` `LASTSAVE` `AUTH` `CONFIG` `CLIENT` `SELECT` `COMMAND` `DUMP` `RESTORE` `OBJECT` `MEMORY`
 
 ## Architecture
 
